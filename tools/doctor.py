@@ -91,6 +91,8 @@ def inspect_install(args: argparse.Namespace) -> dict[str, Any]:
     }
     for name, path in executable_files.items():
         allowed_mode = 0o555 if hardened else 0o700
+        if hardened and name == "fda_wrapper":
+            allowed_mode = 0o4555  # setuid root to read the root-only gate.json
         ok = (
             path.is_file()
             and not has_symlink_component(path)
@@ -139,6 +141,22 @@ def inspect_install(args: argparse.Namespace) -> dict[str, Any]:
         f"{allowlist} uid={allowlist.stat().st_uid if allowlist.exists() else 'missing'} "
         f"mode={oct(mode(allowlist)) if allowlist.exists() else 'missing'}",
     )
+
+    if hardened:
+        # Root-only secrets: readable by the setuid wrapper, never by this user.
+        gate_json = code_root.parent / "config" / "gate.json"
+        gate_ok = (
+            gate_json.is_file()
+            and not has_symlink_component(gate_json)
+            and gate_json.stat().st_uid == 0
+            and mode(gate_json) == 0o600
+            and not os.access(gate_json, os.R_OK)
+        )
+        checks["gate_config_root_only"] = check(
+            "pass" if gate_ok else "fail",
+            f"{gate_json} mode={oct(mode(gate_json)) if gate_json.exists() else 'missing'} "
+            f"readable_by_user={os.access(gate_json, os.R_OK) if gate_json.exists() else 'n/a'}",
+        )
 
     if not args.skip_codesign:
         for name, path in executable_files.items():

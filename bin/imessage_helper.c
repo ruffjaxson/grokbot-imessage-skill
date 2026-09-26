@@ -14,7 +14,9 @@
  *   runs the bundled interpreter with -I -B.
  */
 
+#define __STDC_WANT_LIB_EXT1__ 1
 #include <errno.h>
+#include <fcntl.h>
 #include <libgen.h>
 #include <limits.h>
 #include <pwd.h>
@@ -88,6 +90,24 @@ extern int _NSGetExecutablePath(char *buf, uint32_t *bufsize);
 #ifndef GATE_CLIENT_SCRIPT
 /* Optional: approval-gate client path for validation and IMESSAGE_GATE_CLIENT_PATH. */
 #endif
+
+/*
+ * GATE_SECRETS_VIA_FD (hardened installs): the wrapper is installed setuid
+ * root and gate.json is root-only (0600, no ACL), so no same-user process can
+ * read the helper token or the contact-ref HMAC key. While still privileged,
+ * the wrapper copies gate.json into a pipe, then irrevocably drops to the real
+ * uid/gid before doing anything else. The worker reads the secrets from the
+ * inherited pipe named by IMESSAGE_GATE_SECRETS_FD.
+ */
+#ifndef GATE_SECRETS_VIA_FD
+#define GATE_SECRETS_VIA_FD 0
+#endif
+
+#ifndef GATE_SECRETS_OWNER_UID
+#define GATE_SECRETS_OWNER_UID 0
+#endif
+
+#define GATE_SECRETS_MAX_BYTES 8192
 
 #ifndef REQUIRE_ROOT_POLICY
 #define REQUIRE_ROOT_POLICY 0
@@ -533,6 +553,126 @@ static int set_env_value(char *buffer, size_t size, const char *name,
     }
     return 0;
 }
+
+#if GATE_SECRETS_VIA_FD
+#ifndef IMESSAGE_GATE_PATH
+#error "GATE_SECRETS_VIA_FD requires IMESSAGE_GATE_PATH"
+#endif
+
+/* A setuid program started with fd 0-2 closed would otherwise hand those
+ * numbers to the next open(). */
+static int ensure_standard_fds(void) {
+    for (int fd = 0; fd <= 2; fd++) {
+        if (fcntl(fd, F_GETFD) == -1 && errno == EBADF) {
+            if (open("/dev/null", O_RDWR) != fd) {
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+static int read_gate_secrets_into_pipe(int *read_fd) {
+    int fd = open(IMESSAGE_GATE_PATH, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        fprintf(stderr, "%s: cannot open gate config (%s)\n", HELPER_DISPLAY_NAME,
+                strerror(errno));
+        return 2;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        fprintf(stderr, "%s: gate config is not a regular file; refusing\n",
+                HELPER_DISPLAY_NAME);
+        close(fd);
+        return 3;
+    }
+    if (st.st_uid != (uid_t)GATE_SECRETS_OWNER_UID) {
+        fprintf(stderr, "%s: gate config has uid %u, expected %u; refusing\n",
+                HELPER_DISPLAY_NAME, (unsigned int)st.st_uid,
+                (unsigned int)GATE_SECRETS_OWNER_UID);
+        close(fd);
+        return 4;
+    }
+    if (st.st_mode & (S_IRWXG | S_IRWXO)) {
+        fprintf(stderr, "%s: gate config has group/world permissions; refusing\n",
+                HELPER_DISPLAY_NAME);
+        close(fd);
+        return 5;
+    }
+    if (st.st_size <= 0 || st.st_size > GATE_SECRETS_MAX_BYTES) {
+        fprintf(stderr, "%s: gate config size is out of range; refusing\n",
+                HELPER_DISPLAY_NAME);
+        close(fd);
+        return 7;
+    }
+
+    char buffer[GATE_SECRETS_MAX_BYTES];
+    size_t total = 0;
+    int result = 0;
+    while (total < (size_t)st.st_size) {
+        ssize_t n = read(fd, buffer + total, sizeof(buffer) - total);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            break;
+        }
+        total += (size_t)n;
+    }
+    close(fd);
+
+    int fds[2] = {-1, -1};
+    if (total == 0 || pipe(fds) != 0) {
+        fprintf(stderr, "%s: cannot stage gate config\n", HELPER_DISPLAY_NAME);
+        result = 1;
+    } else {
+        /* total <= 8 KiB fits in the pipe buffer, so this cannot block. */
+        size_t off = 0;
+        while (off < total) {
+            ssize_t w = write(fds[1], buffer + off, total - off);
+            if (w < 0 && errno == EINTR) {
+                continue;
+            }
+            if (w <= 0) {
+                fprintf(stderr, "%s: cannot stage gate config\n", HELPER_DISPLAY_NAME);
+                result = 1;
+                break;
+            }
+            off += (size_t)w;
+        }
+        close(fds[1]);
+        if (result == 0) {
+            *read_fd = fds[0];
+        } else {
+            close(fds[0]);
+        }
+    }
+    memset_s(buffer, sizeof(buffer), 0, sizeof(buffer));
+    return result;
+}
+
+static int drop_privileges(void) {
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    if (uid == 0) {
+        fprintf(stderr, "%s: refusing to run for the root user\n", HELPER_DISPLAY_NAME);
+        return 11;
+    }
+    /* With euid 0, setgid/setuid also replace the saved ids, so this is
+     * irrevocable; prove it before running anything else. */
+    if (setgid(gid) != 0 || setuid(uid) != 0) {
+        fprintf(stderr, "%s: cannot drop privileges (%s)\n", HELPER_DISPLAY_NAME,
+                strerror(errno));
+        return 11;
+    }
+    if (setuid(0) == 0 || seteuid(0) == 0 || geteuid() != uid || getegid() != gid) {
+        fprintf(stderr, "%s: privilege drop is not irrevocable; refusing\n",
+                HELPER_DISPLAY_NAME);
+        return 11;
+    }
+    return 0;
+}
+#endif
 #endif
 
 int main(int argc, char **argv) {
@@ -845,6 +985,22 @@ int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
 
+#if GATE_SECRETS_VIA_FD
+    /* Privileged section: nothing user-controlled is read before the drop. */
+    if (ensure_standard_fds() != 0) {
+        return 1;
+    }
+    int gate_secrets_fd = -1;
+    int secrets_status = read_gate_secrets_into_pipe(&gate_secrets_fd);
+    if (secrets_status != 0) {
+        return secrets_status;
+    }
+    secrets_status = drop_privileges();
+    if (secrets_status != 0) {
+        return secrets_status;
+    }
+#endif
+
     uid_t expected_code_uid =
         EXPECTED_CODE_UID < 0 ? getuid() : (uid_t)EXPECTED_CODE_UID;
     int validation = validate_file(HELPER_SCRIPT, "helper script",
@@ -924,6 +1080,15 @@ int main(int argc, char **argv) {
 #ifdef IMESSAGE_GATE_PATH
     static char gate_path_buf[PATH_MAX + 64];
 #endif
+#if GATE_SECRETS_VIA_FD
+    static char gate_fd_buf[64];
+    char gate_fd_value[16];
+    snprintf(gate_fd_value, sizeof(gate_fd_value), "%d", gate_secrets_fd);
+    if (set_env_value(gate_fd_buf, sizeof(gate_fd_buf), "IMESSAGE_GATE_SECRETS_FD",
+                      gate_fd_value) != 0) {
+        return 7;
+    }
+#endif
 
     if (set_env_value(home_buf, sizeof(home_buf), "HOME",
                       pw && pw->pw_dir ? pw->pw_dir : "/") != 0 ||
@@ -986,13 +1151,17 @@ int main(int argc, char **argv) {
         NULL,
         NULL,
         NULL,
+        NULL,
     };
-    size_t env_next = (sizeof(new_env) / sizeof(new_env[0])) - 5;
+    size_t env_next = (sizeof(new_env) / sizeof(new_env[0])) - 6;
 #ifdef CONTACT_REFS_SCRIPT
     new_env[env_next++] = contact_refs_buf;
 #endif
 #ifdef GATE_CLIENT_SCRIPT
     new_env[env_next++] = gate_client_buf;
+#endif
+#if GATE_SECRETS_VIA_FD
+    new_env[env_next++] = gate_fd_buf;
 #endif
 #ifdef IMESSAGE_GATE_PATH
     new_env[env_next++] = gate_path_buf;

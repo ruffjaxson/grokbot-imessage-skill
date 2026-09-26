@@ -149,12 +149,23 @@ confirmation dialog:
   expiring) come from the gate. Anything not granted becomes an approval that
   only a passkey on the owner's phone can approve. The local blocklist still
   wins.
-- **The helper token cannot approve or grant.** `gate.json` is readable by your
-  user (like the contact-ref key), so any same-user process can read the token.
-  With it, such a process can read the grant list, create approval requests
-  (which reach your phone and are rate-limited), revoke grants, write audit
-  entries, and consume an approval you already granted. It cannot grant access
-  or approve a send, and editing `gate.json` requires root.
+- **Secrets are root-only.** `gate.json` (helper token and contact-ref HMAC key)
+  is root-owned, mode 600, with no user ACL, so no process running as your user
+  can read it.
+  - The FDA wrapper is installed **setuid root**. It reads `gate.json` first,
+    before any other work, and copies it into a pipe.
+  - It then irrevocably drops to your uid/gid, confirming that `setuid(0)` now
+    fails, before it validates anything else or execs Python.
+  - The worker reads the secrets from the inherited pipe (`IMESSAGE_GATE_SECRETS_FD`)
+    and closes it.
+  - Without the token, a same-user process can't query the gate directly. Without
+    the key, it can't reverse `contact_ref`/`thread_ref` values into numbers.
+- **The helper token cannot approve or grant, even if leaked.** With it, a process
+  could read the grant list, create approval requests (which reach your phone and are
+  rate-limited), revoke grants, write audit entries, and consume an approval you
+  already granted.
+- **Other paths to raw numbers are out of this helper's control.** Keep Grok Bot's own
+  Messages automation off, and don't give Grok Bot Contacts or Full Disk Access.
 - **Commit sends the gate's copy.** `send_commit` sends the recipient, service,
   and text stored by the gate at request time, after checking the payload hash.
   The request cannot substitute its own text.

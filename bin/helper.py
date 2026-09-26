@@ -1216,7 +1216,8 @@ def _build_gate_context() -> GateContext:
         data = _contact_refs.load_gate_config()
     except _contact_refs.ContactRefError as exc:
         try:
-            present = os.path.lexists(_contact_refs._gate_path())
+            # A secrets pipe that fails to parse is as untrusted as a bad file.
+            present = _contact_refs.secrets_via_fd() or os.path.lexists(_contact_refs._gate_path())
         except _contact_refs.ContactRefError:
             present = False
         if not present:

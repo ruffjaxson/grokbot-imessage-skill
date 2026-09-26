@@ -230,10 +230,12 @@ PYCHECK
     echo "Error: existing hardened gate.json is not a protected root-owned file." >&2
     exit 1
 fi
+# gate.json holds the helper token and contact-ref HMAC key. It stays root-only
+# (0600, no user ACL): the setuid wrapper reads it and passes it to the worker
+# on a pipe, so no process running as the user can read it.
 if ! sudo "$CHMOD_BIN" -N "$GATE_JSON" 2>/dev/null; then
     echo "  no existing ACL to clear on gate.json"
 fi
-sudo "$CHMOD_BIN" +a "user:$CURRENT_USER allow read" "$GATE_JSON"
 
 clang -Wall -Wextra -Werror -fobjc-arc \
     -framework AppKit -framework Foundation \
@@ -251,6 +253,7 @@ clang -Wall -Wextra -Werror -O2 \
     -DIMESSAGE_GATE_PATH="\"$GATE_JSON\"" \
     -DCONTACT_REFS_SCRIPT="\"$CONTACT_REFS_PY\"" \
     -DGATE_CLIENT_SCRIPT="\"$GATE_CLIENT_PY\"" \
+    -DGATE_SECRETS_VIA_FD=1 \
     -DREQUIRE_ROOT_POLICY=1 \
     -DHELPER_DISPLAY_NAME='"grokbot-imessage-helper"' \
     -DHOST_DISPLAY_NAME='"Grok Bot"' \
@@ -277,7 +280,9 @@ sudo "$INSTALL_BIN" -o root -g wheel -m 444 \
     "$SOURCE_ROOT/bin/imessage_helper.c" "$CODE_ROOT/bin/imessage_helper.c"
 sudo "$INSTALL_BIN" -o root -g wheel -m 444 \
     "$SOURCE_ROOT/bin/confirm_imessage_send.m" "$CODE_ROOT/bin/confirm_imessage_send.m"
-sudo "$INSTALL_BIN" -o root -g wheel -m 555 \
+# setuid root: only to read the root-only gate.json before irrevocably
+# dropping to the invoking user (see GATE_SECRETS_VIA_FD in imessage_helper.c).
+sudo "$INSTALL_BIN" -o root -g wheel -m 4555 \
     "$BUILD_DIR/grokbot-imessage-helper" "$CODE_ROOT/bin/grokbot-imessage-helper"
 sudo "$INSTALL_BIN" -o root -g wheel -m 555 \
     "$BUILD_DIR/grokbot-imessage-confirm" "$CODE_ROOT/bin/grokbot-imessage-confirm"
@@ -340,7 +345,7 @@ To enable or change the approval gate (token is prompted, never echoed):
 Without a gate, add an allowed contact before reading:
   "$PYTHON3_PATH" "$CODE_ROOT/tools/configure_allowlist.py" add +15551234567
 
-Grant Full Disk Access to:
+Grant Full Disk Access to (remove and re-add it after every reinstall):
   $CODE_ROOT/bin/grokbot-imessage-helper
 
 Then verify:
