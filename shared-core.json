@@ -19,7 +19,12 @@
       "logical_name": "helper.py",
       "path": "bin/helper.py",
       "normalization": "identity",
-      "sha256": "6f08690c1bc383973bd455fe3c12bd76d167b01a07f310d865a0c7aaa6394af8"
+      "sha256": "0e38eaa986269008bea90ada7f8027d698384e5e7409943be59ddc48563ef7ad"
+    },
+    {
+      "logical_name": "contact_refs.py",
+      "path": "bin/contact_refs.py",
+      "sha256": "53938d24339c196dfd8f765ca74d1ddfa4ad4d8c5665d49711f864db3b4f3e0e"
     },
     {
       "logical_name": "send_gate.py",
@@ -29,7 +34,7 @@
     {
       "logical_name": "imessage_helper.c",
       "path": "bin/imessage_helper.c",
-      "sha256": "cfa3c457336cf1eb142a59c1e828ab5cbb5a44659f63705cc648902e75a0e0dc"
+      "sha256": "2a1a504e87a13631f7f792b5e4a2a1d53e77e73ebad5ac012acdb622df911115"
     },
     {
       "logical_name": "confirm_imessage_send.m",
