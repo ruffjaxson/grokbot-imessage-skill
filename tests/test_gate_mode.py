@@ -82,6 +82,7 @@ class FakeGate:
         self.calls: list[str] = []
         self.fail: Exception | None = None
         self.unknown_senders: dict | None = None
+        self.grok_added: list[str] = []
         self.config = gate_client.GateConfig("https://gate.test", TOKEN)
 
     def _enter(self, name):
@@ -94,7 +95,12 @@ class FakeGate:
         out = {"generated_at": "2026-09-25T00:00:00+00:00", "grants": list(self.grants)}
         if self.unknown_senders is not None:
             out["unknown_senders"] = self.unknown_senders
+        out["grok_added_handles"] = sorted(set(self.grok_added))
         return out
+
+    def record_grok_contact(self, handle):
+        self._enter("record_grok_contact")
+        self.grok_added.append(handle)
 
     def create_approval(self, kind, payload):
         self._enter("create_approval")
@@ -1275,7 +1281,7 @@ class GrantPresetRequestTests(GateModeTestCase):
         result, payload = self.payload({"preset": "trusted"})
         self.assertEqual(payload["scopes"], ["read", "send"])
         self.assertIsNone(payload["duration_seconds"])
-        self.assertEqual(payload["lookback"], "all")
+        self.assertEqual(payload["lookback"], "grant_time")  # narrowest; the phone can widen it
         _, payload = self.payload({"preset": "trusted", "lookback": "30d", "scopes": ["watch"]})
         self.assertEqual((payload["scopes"], payload["lookback"]), (["read", "send", "watch"], "30d"))
 
@@ -1414,6 +1420,16 @@ class UnknownSenderTests(GateModeTestCase):
         self.assertEqual(again["status"], "sent")
         self.assertIn(f'buddy "{STRANGER}"', self.scripts[-1])
 
+    def test_only_style_45_chats_count_as_1to1(self) -> None:
+        c = sqlite3.connect(str(self.db))
+        c.execute("INSERT INTO chat VALUES (7, 'odd-group-id', 'Odd', 'iMessage', 43)")
+        c.commit()
+        c.close()
+        idents = helper._one_to_one_identifiers(self._direct())
+        self.assertIn(STRANGER, idents)
+        self.assertNotIn("odd-group-id", idents)
+        self.assertFalse(any(i.startswith("chat") for i in idents))
+
     def test_group_thread_ref_cannot_be_a_send_target(self) -> None:
         with self.assertRaisesRegex(ValueError, "unknown thread_ref"):
             self.run_action("send", {"thread_ref": helper.thread_ref("chat100200300"), "text": "hi"})
@@ -1463,6 +1479,60 @@ class UnknownSenderTests(GateModeTestCase):
         self.assertEqual(helper.load_gate_policy(helper._GATE_CONTEXT, contacts).send, ())
         self.gate.grants = [dict(grant(5, STRANGER, "send", display_name="Mom"), contact_origin="added_by_grok")]
         self.assertEqual(helper.load_gate_policy(helper._GATE_CONTEXT, contacts).send, (STRANGER,))
+
+    def test_gate_record_survives_local_registry_deletion(self) -> None:
+        self.run_action("save_contact", {"thread_ref": self.stranger_thread, "name": "Dave Plumber"})
+        self.assertEqual(self.gate.grok_added, [STRANGER])
+        helper.GROK_ADDED_PATH.unlink()
+        contacts = {**CONTACTS, "5557771234": "Dave Plumber"}
+        helper._CONTACT_RAW_HANDLES["5557771234"] = STRANGER
+        helper.load_gate_policy(helper._GATE_CONTEXT, contacts)  # refreshes the gate's record
+        self.assertEqual(helper.contact_origin(STRANGER, contacts), "added_by_grok")
+
+    def test_save_contact_refuses_duplicate_names_and_blocked(self) -> None:
+        for name in ("alice   EXAMPLE", "\u00c1lice Example", "Carol Example"):
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "already exists"):
+                self.run_action("save_contact", {"thread_ref": self.stranger_thread, "name": name})
+        self.blocklist.write_text(STRANGER + "\n")
+        with self.assertRaisesRegex(ValueError, "blocked"):
+            self.run_action("save_contact", {"thread_ref": self.stranger_thread, "name": "Dave"})
+        self.assertEqual(self.scripts, [])
+        self.assertEqual(self.gate.grok_added, [])
+
+    def test_save_contact_needs_the_gate_record(self) -> None:
+        self.gate.record_grok_contact = mock.Mock(side_effect=gate_client.GateUnavailable("down"))
+        with self.assertRaisesRegex(RuntimeError, "approval gate unavailable"):
+            self.run_action("save_contact", {"thread_ref": self.stranger_thread, "name": "Dave"})
+        self.assertEqual(self.scripts, [])
+
+    def test_loosely_matching_saved_contact_is_not_unknown(self) -> None:
+        # Saved in local format ("07700 900123") but messaging as +447700900123.
+        contacts = {**CONTACTS, "7700900123": "UK Alice"}
+        helper._CONTACT_RAW_HANDLES["7700900123"] = "07700 900123"
+        policy = helper.load_gate_policy(helper._GATE_CONTEXT, contacts)
+        self.assertFalse(helper.is_read_allowed("+447700900123", "+447700900123", policy))
+        self.assertTrue(helper.is_read_allowed(STRANGER, STRANGER, policy))
+
+    def test_contacts_load_failure_blocks_unknown_senders(self) -> None:
+        policy = helper.load_gate_policy(helper._GATE_CONTEXT, {})
+        self.assertFalse(policy.unknown_enabled)
+        self.assertEqual(policy.unknown_blocked_reason, "contacts unavailable")
+        self.assertFalse(helper.is_read_allowed(STRANGER, STRANGER, policy))
+        self.assertEqual(helper.action_status({}, None, {}, policy)["gate"]["unknown_senders"], "off (contacts unavailable)")
+        with mock.patch.object(helper, "load_contacts", return_value={"4155551234": "Alice"}), \
+                mock.patch.object(helper, "_CONTACTS_LOAD_OK", False):
+            self.assertFalse(helper.load_gate_policy(helper._GATE_CONTEXT).unknown_enabled)
+
+    def test_strangers_sharing_last_10_digits_get_distinct_refs(self) -> None:
+        a = helper.contact_ref_for("+14155550000", CONTACTS)
+        b = helper.contact_ref_for("+444155550000", CONTACTS)
+        self.assertNotEqual(a, b)
+        self.assertEqual(helper.contact_ref_for("(415) 555-1234", CONTACTS), self.ref("4155551234"))
+        # The stranger's ref from a read resolves to exactly that handle.
+        search = self.run_action("search", {"term": "stranger", "days": 90}, self.conn)
+        ref = search["matches"][0]["contact_ref"]
+        self.assertEqual(ref, helper.contact_ref_for(STRANGER, CONTACTS))
+        self.assertEqual(helper.resolve_send_recipient({"contact_ref": ref}, CONTACTS), STRANGER)
 
     def test_note_marker_alone_marks_origin(self) -> None:
         contacts = {**CONTACTS, "5557771234": "Dave"}

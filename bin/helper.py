@@ -35,6 +35,7 @@ import sys
 import tempfile
 import time
 import traceback
+import unicodedata
 import uuid
 from collections import defaultdict
 from contextlib import contextmanager
@@ -638,6 +639,12 @@ _CONTACT_RAW_HANDLES: dict[str, str] = {}
 _CONTACT_HANDLE_LABELS: dict[str, str] = {}
 # Contacts keys whose AddressBook note carries GROK_ADDED_MARKER (save_contact).
 _CONTACT_GROK_ADDED: set[str] = set()
+# Handles the gate recorded as saved by Grok (authoritative; add-only there).
+_GATE_GROK_ADDED: set[str] = set()
+# Whether the last load_contacts() read every AddressBook source cleanly, and
+# whether their notes could be checked for the Grok marker.
+_CONTACTS_LOAD_OK = False
+_CONTACT_NOTES_OK = False
 GROK_ADDED_MARKER = "Added by Grok Bot (grokbot-imessage)"
 GROK_CONTACTS_GROUP = "Added by Grok"
 
@@ -672,6 +679,9 @@ def load_contacts() -> dict[str, str]:
     how many handles were loaded so debugging doesn't require guessing.
     """
     global _CONTACT_RAW_HANDLES, _CONTACT_HANDLE_LABELS, _CONTACT_GROK_ADDED
+    global _CONTACTS_LOAD_OK, _CONTACT_NOTES_OK
+    load_ok = True
+    notes_ok = True
     handle_to_name: dict[str, str] = {}
     raw_handles: dict[str, str] = {}
     handle_labels: dict[str, str] = {}
@@ -684,15 +694,17 @@ def load_contacts() -> dict[str, str]:
     if not db_files:
         log("contacts: no AddressBook-v22.abcddb files found "
             "(checked Sources/* and top-level)")
+        _CONTACTS_LOAD_OK = False
+        _CONTACT_NOTES_OK = False
         return handle_to_name
 
     total_phones = 0
     total_emails = 0
     for p in db_files:
         try:
-            # immutable=1 is a belt-and-suspenders: read-only *and* skip
-            # locking, which avoids contending with Contacts.app.
-            conn = sqlite3.connect(f"file:{p}?mode=ro&immutable=1", uri=True)
+            # Read-only, but not immutable=1: that would skip the WAL and
+            # miss contacts saved moments ago (e.g. by save_contact).
+            conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=5)
             cur = conn.cursor()
 
             # 1. Build Z_PK -> display name map. Person records get
@@ -725,8 +737,9 @@ def load_contacts() -> dict[str, str]:
                 grok_owners = {
                     owner for owner, text in cur.fetchall() if text and GROK_ADDED_MARKER in str(text)
                 }
-            except sqlite3.Error:
-                pass
+            except sqlite3.Error as e:
+                notes_ok = False
+                log(f"contacts: notes table unreadable on {p}: {e}")
 
             # 2. Phone numbers.
             try:
@@ -758,6 +771,7 @@ def load_contacts() -> dict[str, str]:
                                 grok_added.add(key)
                             total_phones += 1
             except sqlite3.Error as e:
+                load_ok = False
                 log(f"contacts: phones table error on {p}: {e}")
 
             # 3. Email addresses. Prefer the normalized form, fall back to raw.
@@ -782,6 +796,7 @@ def load_contacts() -> dict[str, str]:
                         cur.execute("SELECT ZOWNER, ZADDRESS FROM ZABCDEMAILADDRESS")
                         rows = [(o, None, a, None, 0) for (o, a) in cur.fetchall()]
                     except sqlite3.Error as e:
+                        load_ok = False
                         log(f"contacts: emails table error on {p}: {e}")
                         rows = []
             for owner, norm, raw, zlabel, _ordering in rows:
@@ -803,11 +818,14 @@ def load_contacts() -> dict[str, str]:
 
             conn.close()
         except Exception as e:
+            load_ok = False
             log(f"contacts: warn on {p}: {e}")
 
     _CONTACT_RAW_HANDLES = raw_handles
     _CONTACT_HANDLE_LABELS = handle_labels
     _CONTACT_GROK_ADDED = grok_added
+    _CONTACTS_LOAD_OK = load_ok and bool(handle_to_name)
+    _CONTACT_NOTES_OK = notes_ok
     log(f"contacts: loaded {len(handle_to_name)} handles "
         f"({total_phones} phones, {total_emails} emails) "
         f"from {len(db_files)} source(s)")
@@ -946,6 +964,17 @@ def unknown_sender_name(key: str) -> str:
     return f"Unknown sender ···{key[-4:]}"
 
 
+def contact_ref_for(handle: str, contacts: dict[str, str], key: bytes | None = None) -> str | None:
+    """Saved contacts: HMAC of the contacts key (what contacts_lookup returns).
+    Everyone else: HMAC of the full canonical handle, so two strangers whose
+    last 10 digits match never share a ref."""
+    normalized = _normalize_handle(handle or "")
+    if normalized and normalized in contacts:
+        return _contact_refs.make_contact_ref(normalized, key)
+    canonical = canonical_handle(handle or "")
+    return _contact_refs.make_contact_ref("handle:" + canonical, key) if canonical else None
+
+
 def person_view(handle: str, contacts: dict[str, str]) -> dict[str, Any]:
     key = _normalize_handle(handle or "")
     if not key:
@@ -955,7 +984,7 @@ def person_view(handle: str, contacts: dict[str, str]) -> dict[str, Any]:
     return {
         "name": contacts[key] if known else unknown_sender_name(key),
         "label": contact_handle_label(key) or ("email" if "@" in key else "phone"),
-        "contact_ref": _contact_refs.make_contact_ref(key),
+        "contact_ref": contact_ref_for(handle, contacts),
         "known": known,
     }
 
@@ -1032,6 +1061,9 @@ class PrivacyPolicy:
     unknown_enabled: bool = False
     unknown_floor: int | None = None
     known_handles: frozenset = field(default_factory=frozenset, compare=False, hash=False)
+    known_keys: frozenset = field(default_factory=frozenset, compare=False, hash=False)
+    # Why unknown senders are off despite the gate setting (e.g. Contacts failed to load).
+    unknown_blocked_reason: str | None = None
 
 
 GRANT_SCOPES = ("send", "read", "watch")
@@ -1066,7 +1098,11 @@ def _unknown_match(chat_id: str, policy: PrivacyPolicy) -> bool:
     if not policy.unknown_enabled or policy.unknown_floor is None:
         return False
     c = canonical_handle(chat_id)
-    return c is not None and c not in policy.known_handles
+    if c is None or c in policy.known_handles:
+        return False
+    # Loose (last-10) match against Contacts fails safe: anything that might be
+    # a saved contact still needs that contact's own grant.
+    return _normalize_handle(chat_id) not in policy.known_keys
 
 
 def scoped_policy(policy: PrivacyPolicy | list[str], scope: str) -> PrivacyPolicy:
@@ -1129,7 +1165,7 @@ def contact_origin(handle: str, contacts: dict[str, str]) -> str:
     key = _normalize_handle(handle)
     if not key or key not in contacts or canonical_handle(contact_raw_handle(key)) != handle:
         return "unknown"
-    if key in _CONTACT_GROK_ADDED or handle in _grok_added_registry():
+    if key in _CONTACT_GROK_ADDED or handle in _GATE_GROK_ADDED or handle in _grok_added_registry():
         return "added_by_grok"
     return "contacts"
 
@@ -1317,10 +1353,22 @@ def load_gate_policy(ctx: GateContext, contacts: dict[str, str] | None = None) -
     except ctx.errors as exc:
         log(f"gate: policy fetch failed, failing closed: {exc}")
         return replace(closed, gate_error=GATE_UNAVAILABLE_MESSAGE)
-    contacts = load_contacts() if contacts is None else contacts
+    if contacts is None:
+        contacts = load_contacts()
+        contacts_ok = _CONTACTS_LOAD_OK
+    else:
+        contacts_ok = bool(contacts)
+    global _GATE_GROK_ADDED
+    recorded = data.get("grok_added_handles")
+    _GATE_GROK_ADDED = {h for h in recorded if isinstance(h, str)} if isinstance(recorded, list) else set()
     grants = _normalize_grants(data["grants"], contacts)
     unknown = data.get("unknown_senders") if isinstance(data.get("unknown_senders"), dict) else {}
     unknown_floor_dt = _parse_iso(unknown.get("floor_at")) if unknown.get("enabled") is True else None
+    blocked_reason = None
+    if unknown_floor_dt is not None and not contacts_ok:
+        # Without a complete Contacts list every thread would look unknown.
+        blocked_reason = "contacts unavailable"
+        unknown_floor_dt = None
     known_handles = frozenset(
         c for c in (canonical_handle(contact_raw_handle(k)) for k in contacts) if c is not None
     )
@@ -1351,6 +1399,8 @@ def load_gate_policy(ctx: GateContext, contacts: dict[str, str] | None = None) -
         unknown_enabled=unknown_floor_dt is not None,
         unknown_floor=to_apple_ns(unknown_floor_dt.timestamp()) if unknown_floor_dt else None,
         known_handles=known_handles,
+        known_keys=frozenset(contacts),
+        unknown_blocked_reason=blocked_reason,
     )
 
 
@@ -1706,13 +1756,14 @@ def _agent_recipient_view(
         contact_handle_label(normalized) or ("email" if "@" in normalized else "phone"),
     )
     view["known"] = normalized in contacts
+    view["contact_ref"] = contact_ref_for(to, contacts)
     return view
 
 
 def _one_to_one_identifiers(conn: sqlite3.Connection) -> list[str]:
     """Every 1:1 chat identifier and message handle in chat.db (no groups)."""
     rows = conn.execute(
-        "SELECT chat_identifier FROM chat WHERE chat_identifier NOT LIKE 'chat%' "
+        "SELECT chat_identifier FROM chat WHERE style = 45 "
         "UNION SELECT id FROM handle"
     ).fetchall()
     return [i for i in (_decode_db_text(r[0]).strip() for r in rows) if i]
@@ -1735,10 +1786,10 @@ def resolve_ref_via_chatdb(ref: str, kind: str) -> str:
             if kind == "thread_ref":
                 candidate = _contact_refs.make_contact_ref("thread:" + ident, key)
             else:
-                normalized = _normalize_handle(ident)
-                if not normalized:
+                canonical = canonical_handle(ident)
+                if not canonical:
                     continue
-                candidate = _contact_refs.make_contact_ref(normalized, key)
+                candidate = _contact_refs.make_contact_ref("handle:" + canonical, key)
             if hmac.compare_digest(candidate, ref):
                 return ident
     finally:
@@ -2241,7 +2292,9 @@ def resolve_read_target(params: dict[str, Any], contacts: dict[str, str]) -> Rea
         try:
             key = _contact_refs.resolve_contact_ref(params["contact_ref"], contacts)
         except ValueError:
-            key = _normalize_handle(resolve_ref_via_chatdb(params["contact_ref"], "contact_ref"))
+            # An unsaved number: read exactly its 1:1 thread, never look-alikes.
+            ident = resolve_ref_via_chatdb(params["contact_ref"], "contact_ref")
+            return ReadTarget(None, None, thread_ref(ident), person_view(ident, contacts))
         return ReadTarget(None, key, None, person_view(key, contacts))
     if given[0] == "thread_ref":
         ref = params["thread_ref"]
@@ -2515,7 +2568,9 @@ def _gate_status(policy: PrivacyPolicy) -> dict[str, Any]:
         "reachable": policy.source == "gate" and policy.gate_error is None,
         "error": policy.gate_error,
         "grant_counts": {scope: len(getattr(policy, scope)) for scope in GRANT_SCOPES},
-        "unknown_senders": policy.unknown_enabled,
+        "unknown_senders": "on" if policy.unknown_enabled else (
+            f"off ({policy.unknown_blocked_reason})" if policy.unknown_blocked_reason else "off"
+        ),
     }
 
 
@@ -2819,7 +2874,7 @@ def _gate_call(ctx: GateContext, fn, *args, **kwargs):
     try:
         return fn(*args, **kwargs)
     except ctx.module.GateUnavailable as exc:
-        log(f"gate: {fn.__name__} failed: {exc}")
+        log(f"gate: {getattr(fn, '__name__', 'call')} failed: {exc}")
         raise RuntimeError(GATE_UNAVAILABLE_MESSAGE) from None
 
 
@@ -3003,7 +3058,7 @@ STANDARD_DURATIONS = ("1d", "1w")
 def resolve_grant_request(params: dict[str, Any]) -> tuple[list[str], int | None, str | None]:
     """(scopes, duration_seconds, lookback) for request_grant.
 
-    preset "trusted": permanent send + read (+ watch if asked), lookback default "all".
+    preset "trusted": permanent send + read (+ watch if asked), lookback default "grant_time".
     preset "standard": send only, duration "1d" (default) or "1w".
     no preset: explicit scopes + duration; read/watch lookback defaults to "grant_time".
     The approver can still pick a different preset on their phone.
@@ -3015,7 +3070,8 @@ def resolve_grant_request(params: dict[str, Any]) -> tuple[list[str], int | None
     if preset == "trusted":
         extra = validate_scopes(params["scopes"]) if params.get("scopes") else []
         scopes = sorted({"send", "read"} | ({"watch"} if "watch" in extra else set()))
-        return scopes, None, lookback or "all"
+        # Narrowest by default; the approver can widen it on the phone.
+        return scopes, None, lookback or "grant_time"
     if preset == "standard":
         if lookback is not None:
             raise ValueError("the standard preset is send-only; request read separately")
@@ -3112,7 +3168,7 @@ def _grant_view(grant: dict[str, Any], contacts: dict[str, str]) -> dict[str, An
         "name": contacts.get(key) or unknown_sender_name(key),
         "label": contact_handle_label(key) or ("email" if "@" in key else "phone"),
         "service": _contact_refs.contact_service(key),
-        "contact_ref": _contact_refs.make_contact_ref(key),
+        "contact_ref": contact_ref_for(grant["handle"], contacts),
     }
 
 
@@ -3148,11 +3204,7 @@ def action_revoke_grant(params, conn, contacts, privacy_policy):
             g["id"]
             for g in policy.grants
             if (scope is None or g["scope"] == scope)
-            and _normalize_handle(g["handle"])
-            and hmac.compare_digest(
-                _contact_refs.make_contact_ref(_normalize_handle(g["handle"]), key),
-                ref.strip(),
-            )
+            and hmac.compare_digest(contact_ref_for(g["handle"], contacts, key) or "", ref.strip())
         ]
         if not ids:
             raise ValueError("no active grants match that contact_ref")
@@ -3177,7 +3229,6 @@ def action_revoke_grant(params, conn, contacts, privacy_policy):
 
 
 action_revoke_grant.needs_db = False  # type: ignore[attr-defined]
-action_revoke_grant.needs_contacts = False  # type: ignore[attr-defined]
 
 
 def _load_state_file(path: Path) -> dict[str, Any]:
@@ -3420,6 +3471,13 @@ def validate_contact_name(v: Any) -> str:
     return name
 
 
+def _name_fingerprint(name: str) -> str:
+    """Case-, accent-, and whitespace-insensitive form for collision checks."""
+    decomposed = unicodedata.normalize("NFKD", name)
+    stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    return " ".join(stripped.casefold().split())
+
+
 def _save_contact_script(name: str, handle: str) -> str:
     first, _, last = name.partition(" ")
     kind = "email" if "@" in handle else "phone"
@@ -3461,6 +3519,17 @@ def action_save_contact(params, conn, contacts, privacy_policy):
     key = _normalize_handle(handle)
     if key in contacts:
         raise ValueError("that person is already in Contacts; Grok can't edit existing contacts")
+    if is_blocked(handle, handle, policy):
+        raise ValueError("refusing: that handle is in contacts/blocked_chats.txt")
+    fingerprint = _name_fingerprint(name)
+    if any(_name_fingerprint(existing) == fingerprint for existing in set(contacts.values())):
+        raise ValueError("a contact with that name already exists; ask the user for a different name")
+    # Record on the gate first (add-only, authoritative for "added by Grok").
+    # If the gate can't record it, don't create the contact.
+    try:
+        _gate_call(ctx, ctx.client.record_grok_contact, handle)
+    except ctx.module.GateError as exc:
+        raise _gate_request_error(exc) from None
     rc, stdout, stderr = _run_osascript(_save_contact_script(name, handle))
     if rc != 0:
         log(f"save_contact osascript failed (rc={rc}): {stderr or stdout or 'no output'}")
@@ -3478,7 +3547,7 @@ def action_save_contact(params, conn, contacts, privacy_policy):
         "saved": {
             "name": name,
             "label": "email" if "@" in key else "mobile",
-            "contact_ref": _contact_refs.make_contact_ref(key),
+            "contact_ref": _contact_refs.make_contact_ref(key),  # a saved contact's ref from now on
             "added_by_grok": True,
             "grants": "none: saving a contact grants nothing",
         }

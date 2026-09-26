@@ -50,7 +50,7 @@ if [[ "$action" == "test" ]]; then
     url="$(plutil -extract url raw -o - "$CONFIG")"
     key="$(plutil -extract key raw -o - "$CONFIG")"
     printf 'url = "%s"\nheader = "Authorization: Bearer %s"\n' "$url" "$key" |
-        "$CURL" --silent --show-error --fail --max-time 15 --proto '=https' \
+        "$CURL" -q --silent --show-error --fail --max-time 15 --proto '=https' \
             --request POST --header 'Content-Type: application/json' \
             --data '{"event":"imessage_watch","test":true}' --config - > /dev/null
     echo "Test trigger sent. Check that the routine ran in Grok Bot."

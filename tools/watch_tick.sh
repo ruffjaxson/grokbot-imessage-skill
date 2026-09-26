@@ -90,7 +90,7 @@ fi
 if [[ "$pending" -eq 1 && $(( now - last_post )) -ge "$min_interval" ]]; then
     # The key goes to curl on stdin (--config -), never on its command line.
     if printf 'url = "%s"\nheader = "Authorization: Bearer %s"\n' "$url" "$key" |
-        "$CURL" --silent --show-error --fail --max-time 15 --proto '=https' \
+        "$CURL" -q --silent --show-error --fail --max-time 15 --proto '=https' \
             --request POST --header 'Content-Type: application/json' \
             --data '{"event":"imessage_watch"}' --config - > /dev/null 2>> "$LOG"; then
         last_post="$now"

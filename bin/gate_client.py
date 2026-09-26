@@ -245,6 +245,10 @@ class GateClient:
             raise ValueError("grant_id must be a positive integer")
         return self._request("POST", f"/v1/grants/{grant_id}/revoke")
 
+    def record_grok_contact(self, handle: str) -> None:
+        """Add-only record that Grok saved this handle to Contacts."""
+        self._request("POST", "/v1/grok-contacts", {"handle": handle})
+
     def audit(
         self,
         event: str,

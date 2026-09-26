@@ -99,6 +99,7 @@ class WatchTickTests(unittest.TestCase):
         self.assertNotIn(KEY, argv)  # the key never appears on a command line
         self.assertIn('{"event":"imessage_watch"}', argv)
         self.assertIn("--proto =https", argv)
+        self.assertTrue(argv.startswith("ARGV -q "))  # ~/.curlrc is ignored
         log = self.curl_log.read_text()
         self.assertIn(f'STDIN header = "Authorization: Bearer {KEY}"', log)
         self.assertIn(f'STDIN url = "{URL}"', log)
