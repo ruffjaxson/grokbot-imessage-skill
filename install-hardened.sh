@@ -16,6 +16,9 @@ if [[ "$(uname)" != "Darwin" ]]; then
 fi
 
 SOURCE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=tools/privileged_tools.sh
+source "$SOURCE_ROOT/tools/privileged_tools.sh"
+load_privileged_tool_paths
 PRODUCT_ROOT="/Library/Application Support/GrokBotIMessage"
 USER_ROOT="$PRODUCT_ROOT/users/$UID"
 CODE_ROOT="$USER_ROOT/libexec"
@@ -132,7 +135,7 @@ chmod 600 "$BRIDGE_ROOT/contacts/blocked_chats.txt" \
 
 echo "Requesting administrator access for the root-owned code and policy..."
 sudo -v
-sudo /usr/bin/install -d -o root -g wheel -m 755 \
+sudo "$INSTALL_BIN" -d -o root -g wheel -m 755 \
     "$PRODUCT_ROOT" "$PRODUCT_ROOT/users" "$USER_ROOT" "$CODE_ROOT" \
     "$CODE_ROOT/bin" "$CODE_ROOT/tools" "$CONFIG_ROOT"
 if [[ -L "$ALLOWLIST" ]]; then
@@ -140,7 +143,7 @@ if [[ -L "$ALLOWLIST" ]]; then
     exit 1
 fi
 if [[ ! -e "$ALLOWLIST" ]]; then
-    sudo /usr/bin/install -o root -g wheel -m 600 \
+    sudo "$INSTALL_BIN" -o root -g wheel -m 600 \
         "$SOURCE_ROOT/contacts/allowed_chats.txt.template" "$ALLOWLIST"
 fi
 if ! "$PYTHON3_PATH" - "$ALLOWLIST" <<'PYCHECK'; then
@@ -156,10 +159,10 @@ PYCHECK
     echo "Error: existing hardened allowlist is not a protected root-owned file." >&2
     exit 1
 fi
-if ! sudo /bin/chmod -N "$ALLOWLIST" 2>/dev/null; then
+if ! sudo "$CHMOD_BIN" -N "$ALLOWLIST" 2>/dev/null; then
     echo "  no existing ACL to clear"
 fi
-sudo /bin/chmod +a "user:$CURRENT_USER allow read" "$ALLOWLIST"
+sudo "$CHMOD_BIN" +a "user:$CURRENT_USER allow read" "$ALLOWLIST"
 
 if [[ -L "$GATE_JSON" ]]; then
     echo "Error: hardened gate config must not be a symlink: $GATE_JSON" >&2
@@ -167,9 +170,11 @@ if [[ -L "$GATE_JSON" ]]; then
 fi
 if [[ ! -e "$GATE_JSON" ]]; then
     "$PYTHON3_PATH" -c 'import json, secrets; print(json.dumps({"schema_version": 1, "contact_ref_hmac_key": secrets.token_urlsafe(32)}))' \
-        | sudo /usr/bin/tee "$GATE_JSON" >/dev/null
-    sudo /usr/bin/chown root:wheel "$GATE_JSON"
-    sudo /bin/chmod 600 "$GATE_JSON"
+        | sudo "$TEE_BIN" "$GATE_JSON" >/dev/null
+fi
+if [[ -e "$GATE_JSON" ]]; then
+    sudo "$CHOWN_BIN" root:wheel "$GATE_JSON"
+    sudo "$CHMOD_BIN" 600 "$GATE_JSON"
 fi
 if ! "$PYTHON3_PATH" - "$GATE_JSON" <<'PYCHECK'; then
 import os
@@ -184,10 +189,10 @@ PYCHECK
     echo "Error: existing hardened gate.json is not a protected root-owned file." >&2
     exit 1
 fi
-if ! sudo /bin/chmod -N "$GATE_JSON" 2>/dev/null; then
+if ! sudo "$CHMOD_BIN" -N "$GATE_JSON" 2>/dev/null; then
     echo "  no existing ACL to clear on gate.json"
 fi
-sudo /bin/chmod +a "user:$CURRENT_USER allow read" "$GATE_JSON"
+sudo "$CHMOD_BIN" +a "user:$CURRENT_USER allow read" "$GATE_JSON"
 
 clang -Wall -Wextra -Werror -fobjc-arc \
     -framework AppKit -framework Foundation \
@@ -218,23 +223,23 @@ fi
 codesign "${SIGN_ARGS[@]}" "$BUILD_DIR/grokbot-imessage-helper"
 codesign "${SIGN_ARGS[@]}" "$BUILD_DIR/grokbot-imessage-confirm"
 
-sudo /usr/bin/install -o root -g wheel -m 444 \
+sudo "$INSTALL_BIN" -o root -g wheel -m 444 \
     "$SOURCE_ROOT/bin/helper.py" "$CODE_ROOT/bin/helper.py"
-sudo /usr/bin/install -o root -g wheel -m 444 \
+sudo "$INSTALL_BIN" -o root -g wheel -m 444 \
     "$SOURCE_ROOT/bin/send_gate.py" "$CODE_ROOT/bin/send_gate.py"
-sudo /usr/bin/install -o root -g wheel -m 444 \
+sudo "$INSTALL_BIN" -o root -g wheel -m 444 \
     "$SOURCE_ROOT/bin/contact_refs.py" "$CODE_ROOT/bin/contact_refs.py"
-sudo /usr/bin/install -o root -g wheel -m 444 \
+sudo "$INSTALL_BIN" -o root -g wheel -m 444 \
     "$SOURCE_ROOT/bin/imessage_helper.c" "$CODE_ROOT/bin/imessage_helper.c"
-sudo /usr/bin/install -o root -g wheel -m 444 \
+sudo "$INSTALL_BIN" -o root -g wheel -m 444 \
     "$SOURCE_ROOT/bin/confirm_imessage_send.m" "$CODE_ROOT/bin/confirm_imessage_send.m"
-sudo /usr/bin/install -o root -g wheel -m 555 \
+sudo "$INSTALL_BIN" -o root -g wheel -m 555 \
     "$BUILD_DIR/grokbot-imessage-helper" "$CODE_ROOT/bin/grokbot-imessage-helper"
-sudo /usr/bin/install -o root -g wheel -m 555 \
+sudo "$INSTALL_BIN" -o root -g wheel -m 555 \
     "$BUILD_DIR/grokbot-imessage-confirm" "$CODE_ROOT/bin/grokbot-imessage-confirm"
-sudo /usr/bin/install -o root -g wheel -m 555 \
+sudo "$INSTALL_BIN" -o root -g wheel -m 555 \
     "$SOURCE_ROOT/tools/doctor.py" "$CODE_ROOT/tools/doctor.py"
-sudo /usr/bin/install -o root -g wheel -m 555 \
+sudo "$INSTALL_BIN" -o root -g wheel -m 555 \
     "$SOURCE_ROOT/tools/configure_allowlist.py" "$CODE_ROOT/tools/configure_allowlist.py"
 
 mkdir -p "$(dirname "$PLIST_DEST")"
