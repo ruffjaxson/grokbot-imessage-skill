@@ -1,8 +1,8 @@
-"""Opaque contact references and masked handles for agent-facing responses.
+"""Opaque contact references for agent-facing responses.
 
 contact_ref values are HMAC-SHA256 digests of normalized handles, keyed by a
 secret in root-owned gate.json. The helper resolves refs back to sendable
-handles internally; agents never receive full phone numbers or emails.
+handles internally; agents receive name, service, and label — not raw numbers.
 """
 from __future__ import annotations
 
@@ -18,21 +18,6 @@ from typing import Any
 
 class ContactRefError(Exception):
     """Raised when gate config or contact_ref resolution fails."""
-
-
-def mask_handle(normalized: str) -> str:
-    """Return a display-safe masked handle for agent responses."""
-    if not normalized:
-        return ""
-    if "@" in normalized:
-        local, domain = normalized.split("@", 1)
-        if not local:
-            return f"***@{domain}"
-        return f"{local[0]}***@{domain}"
-    digits = normalized[-10:] if len(normalized) >= 10 else normalized
-    if len(digits) >= 4:
-        return f"***-***-{digits[-4:]}"
-    return "***"
 
 
 def contact_service(normalized: str) -> str:
@@ -129,13 +114,14 @@ def resolve_contact_ref(
 def lookup_match(
     normalized: str,
     name: str,
+    label: str,
     *,
     key: bytes | None = None,
 ) -> dict[str, str]:
     return {
         "name": name,
-        "masked_handle": mask_handle(normalized),
         "service": contact_service(normalized),
+        "label": label,
         "contact_ref": make_contact_ref(normalized, key),
     }
 

@@ -19,12 +19,12 @@
       "logical_name": "helper.py",
       "path": "bin/helper.py",
       "normalization": "identity",
-      "sha256": "0e38eaa986269008bea90ada7f8027d698384e5e7409943be59ddc48563ef7ad"
+      "sha256": "b0c420644697763e952f7cd06894dfbd6f67c165b70b1d047cca54c38816b326"
     },
     {
       "logical_name": "contact_refs.py",
       "path": "bin/contact_refs.py",
-      "sha256": "53938d24339c196dfd8f765ca74d1ddfa4ad4d8c5665d49711f864db3b4f3e0e"
+      "sha256": "8f7150a27838b1c8f80e2540e56ddb7e5669683cda7cee87a90215fdd874b632"
     },
     {
       "logical_name": "send_gate.py",
