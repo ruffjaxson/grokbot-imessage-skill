@@ -5,6 +5,11 @@ set -euo pipefail
 PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 export PATH
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=tools/privileged_tools.sh
+source "$SCRIPT_DIR/tools/privileged_tools.sh"
+load_privileged_tool_paths
+
 if [[ "$EUID" -eq 0 ]]; then
     echo "Error: run as your normal user; this script invokes sudo narrowly." >&2
     exit 1
@@ -30,10 +35,10 @@ if [[ -d "$SKILL_DEST" ]]; then
     echo "  removed Grok skill $SKILL_DEST"
 fi
 if [[ -d "$USER_ROOT" ]]; then
-    sudo /bin/rm -rf "$USER_ROOT"
+    sudo "$RM_BIN" -rf "$USER_ROOT"
     echo "  removed root-owned helper $USER_ROOT"
-    if sudo /bin/rmdir "$PRODUCT_ROOT/users" 2>/dev/null; then
-        if ! sudo /bin/rmdir "$PRODUCT_ROOT" 2>/dev/null; then
+    if sudo "$RMDIR_BIN" "$PRODUCT_ROOT/users" 2>/dev/null; then
+        if ! sudo "$RMDIR_BIN" "$PRODUCT_ROOT" 2>/dev/null; then
             echo "  retained non-empty $PRODUCT_ROOT"
         fi
     fi
