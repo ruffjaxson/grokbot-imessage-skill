@@ -19,6 +19,12 @@ version reported by the `status` action.
   token without echoing it (or reads `IMESSAGE_GATE_TOKEN_FILE`). The new
   `tools/configure_gate.py` writes `gate.json` atomically at mode 600.
 - Installs without a gate section behave exactly as before.
+- Hardened installs keep `gate.json` root-only. The FDA wrapper is installed
+  setuid root, reads it, passes it to the helper on a pipe, and irrevocably drops
+  privileges before any other work.
+- Added the `com.jeffhuber.grokbot-imessage-watch` LaunchAgent (`tools/watch_tick.sh`)
+  and `tools/configure_watch_webhook.sh`. When watched messages arrive, it sends a
+  content-free trigger to a Grok Bot webhook routine.
 
 ## 1.4.8 - 2026-09-13
 
