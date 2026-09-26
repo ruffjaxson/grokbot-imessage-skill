@@ -27,7 +27,7 @@ _spec.loader.exec_module(contact_refs)
 GATE = {"schema_version": 1, "contact_ref_hmac_key": "k" * 43, "gate_url": "https://g.test", "helper_token": "t" * 43}
 
 PROBE = """
-import json, os, stat, sys
+import json, os, resource, stat, sys
 fd = int(os.environ["IMESSAGE_GATE_SECRETS_FD"])
 st = os.fstat(fd)
 data = b""
@@ -42,6 +42,7 @@ print(json.dumps({
     "content": data.decode(),
     "uid": os.getuid(), "euid": os.geteuid(), "gid": os.getgid(), "egid": os.getegid(),
     "gate_path": os.environ.get("IMESSAGE_GATE_PATH"),
+    "core_limit": list(resource.getrlimit(resource.RLIMIT_CORE)),
 }))
 """
 
@@ -56,7 +57,7 @@ class WrapperSecretsFdTests(unittest.TestCase):
         self.gate.write_text(json.dumps(GATE))
         self.gate.chmod(0o600)
 
-    def build(self, owner_uid: int | None = None) -> Path:
+    def build(self, owner_uid: int | None = None, expected_user: int | None = None) -> Path:
         root = self.root
         helper_script = root / "helper.py"
         helper_script.write_text(PROBE)
@@ -66,8 +67,9 @@ class WrapperSecretsFdTests(unittest.TestCase):
         confirm.write_text("#!/bin/sh\nexit 0\n")
         for path, mode in ((helper_script, 0o500), (send_gate, 0o500), (confirm, 0o700)):
             path.chmod(mode)
-        wrapper = root / f"wrapper-{owner_uid}"
+        wrapper = root / f"wrapper-{owner_uid}-{expected_user}"
         uid = os.getuid() if owner_uid is None else owner_uid
+        user = os.getuid() if expected_user is None else expected_user
         result = subprocess.run(
             [
                 "clang", "-Wall", "-Wextra", "-Werror", "-O2",
@@ -79,6 +81,7 @@ class WrapperSecretsFdTests(unittest.TestCase):
                 f'-DIMESSAGE_GATE_PATH="{self.gate}"',
                 "-DGATE_SECRETS_VIA_FD=1",
                 f"-DGATE_SECRETS_OWNER_UID={uid}",
+                f"-DEXPECTED_USER_UID={user}",
                 "-o", str(wrapper), str(REPO_ROOT / "bin" / "imessage_helper.c"),
             ],
             capture_output=True, text=True, check=False,
@@ -98,6 +101,7 @@ class WrapperSecretsFdTests(unittest.TestCase):
         self.assertEqual(json.loads(out["content"]), GATE)
         self.assertEqual((out["uid"], out["gid"]), (out["euid"], out["egid"]))
         self.assertEqual(out["gate_path"], str(self.gate))
+        self.assertEqual(out["core_limit"], [0, 0])  # no core files, and it can't be raised back
 
     def test_closed_standard_fds_do_not_capture_the_secrets(self) -> None:
         wrapper = self.build()
@@ -134,6 +138,19 @@ class WrapperSecretsFdTests(unittest.TestCase):
         wrapper = self.build()
         self.gate.write_text(json.dumps({**GATE, "pad": "x" * 9000}))
         self.assertEqual(self.run_wrapper(wrapper).returncode, 7)
+
+    def test_other_users_are_refused(self) -> None:
+        result = self.run_wrapper(self.build(expected_user=os.getuid() + 1))
+        self.assertEqual(result.returncode, 12)
+        self.assertIn("refusing uid", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_hardlinked_gate_json_is_refused(self) -> None:
+        wrapper = self.build()
+        os.link(self.gate, self.root / "extra-link.json")
+        result = self.run_wrapper(wrapper)
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("extra hard links", result.stderr)
 
     def test_missing_gate_json_is_refused(self) -> None:
         wrapper = self.build()
@@ -200,12 +217,90 @@ class InstallerSetuidTests(unittest.TestCase):
     def test_wrapper_is_setuid_and_reads_secrets_via_fd(self) -> None:
         self.assertIn("-DGATE_SECRETS_VIA_FD=1", self.script)
         self.assertIn(
-            'sudo "$INSTALL_BIN" -o root -g wheel -m 4555 \\\n    "$BUILD_DIR/grokbot-imessage-helper"',
+            'sudo "$INSTALL_BIN" -o root -g wheel -m 4555 \\\n    "$BUILD_ROOT/grokbot-imessage-helper" "$WRAPPER_DEST"',
             self.script,
         )
+
+    def test_wrapper_is_built_and_signed_as_root_in_a_root_only_dir(self) -> None:
+        self.assertNotIn("mktemp", self.script)
+        self.assertNotIn("BUILD_DIR", self.script)
+        self.assertIn('sudo "$INSTALL_BIN" -d -o root -g wheel -m 700 "$BUILD_ROOT"', self.script)
+        self.assertIn('sudo "$CLANG_BIN" -Wall -Wextra -Werror -O2', self.script)
+        self.assertIn('"$CODE_ROOT/bin/imessage_helper.c"\n', self.script)
+        self.assertIn('sudo "$CODESIGN_BIN" "${SIGN_ARGS[@]}" "$BUILD_ROOT/grokbot-imessage-helper"', self.script)
+        for line in self.script.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(("clang ", "codesign ")):
+                self.fail(f"unprivileged build step: {stripped}")
+
+    def test_wrapper_bakes_uid_and_real_python(self) -> None:
+        self.assertIn('-DEXPECTED_USER_UID="$UID"', self.script)
+        self.assertIn('-DPYTHON_INTERPRETER="\\"$REAL_PYTHON\\""', self.script)
+        self.assertIn("os.path.realpath(sys.executable)", self.script)
+        self.assertIn('hardened_python_is_trusted "$REAL_PYTHON"', self.script)
+
+    def test_setuid_bit_cleared_before_replace_and_uninstall(self) -> None:
+        chmod = self.script.index('sudo "$CHMOD_BIN" 0555 "$WRAPPER_DEST"')
+        self.assertLess(chmod, self.script.index('-m 4555 \\\n    "$BUILD_ROOT/grokbot-imessage-helper"'))
+        uninstall = (REPO_ROOT / "uninstall-hardened.sh").read_text()
+        self.assertLess(uninstall.index('sudo "$CHMOD_BIN" 0555 "$wrapper"'), uninstall.index('sudo "$RM_BIN" -rf "$USER_ROOT"'))
+
+    def test_legacy_acl_forces_secret_rotation(self) -> None:
+        self.assertIn('grep -q "allow read"', self.script)
+        self.assertIn("CONFIGURE_ARGS+=(--rotate-hmac-key)", self.script)
+        self.assertIn("CONFIGURE_ARGS+=(--require-new-token)", self.script)
+        self.assertIn("the old helper token was readable by your user", self.script)
 
     def test_gate_json_gets_no_user_acl(self) -> None:
         self.assertNotIn('allow read" "$GATE_JSON"', self.script)
         self.assertIn('sudo "$CHMOD_BIN" -N "$GATE_JSON"', self.script)
         # The allowlist keeps its user read ACL (legacy mode reads it as the user).
         self.assertIn('allow read" "$ALLOWLIST"', self.script)
+
+
+class ConfigureGateRotationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        spec = importlib.util.spec_from_file_location("configure_gate_rot", REPO_ROOT / "tools" / "configure_gate.py")
+        self.tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.tool)
+        self._tmp = tempfile.TemporaryDirectory(prefix="gate-rotate-")
+        self.addCleanup(self._tmp.cleanup)
+        self.path = Path(self._tmp.name) / "gate.json"
+        self.path.write_text(json.dumps(GATE))
+
+    def run_tool(self, argv, stdin=""):
+        import io
+        from contextlib import redirect_stderr
+
+        with mock.patch.object(sys, "stdin", io.StringIO(stdin)), redirect_stderr(io.StringIO()):
+            return self.tool.main(["--gate-json", str(self.path), *argv])
+
+    def test_rotates_hmac_key_and_keeps_token(self) -> None:
+        self.run_tool(["--rotate-hmac-key"])
+        data = json.loads(self.path.read_text())
+        self.assertNotEqual(data["contact_ref_hmac_key"], GATE["contact_ref_hmac_key"])
+        self.assertEqual(data["helper_token"], GATE["helper_token"])
+
+    def test_require_new_token_refuses_the_old_one(self) -> None:
+        with self.assertRaises(SystemExit):
+            self.run_tool(
+                ["--gate-url", "https://g.test", "--token-stdin", "--require-new-token", "--rotate-hmac-key"],
+                stdin=GATE["helper_token"],
+            )
+        self.assertEqual(json.loads(self.path.read_text()), GATE)
+        new = "n" * 43
+        self.run_tool(
+            ["--gate-url", "https://g.test", "--token-stdin", "--require-new-token", "--rotate-hmac-key"], stdin=new
+        )
+        self.assertEqual(json.loads(self.path.read_text())["helper_token"], new)
+
+
+@unittest.skipUnless(sys.platform == "darwin", "macOS codesign/DevToolsSecurity")
+class DoctorAttachCheckTests(unittest.TestCase):
+    def test_python_attach_checks_report(self) -> None:
+        spec = importlib.util.spec_from_file_location("doctor_attach", REPO_ROOT / "tools" / "doctor.py")
+        doctor = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(doctor)
+        checks = doctor.python_attach_checks(skip_codesign=False)
+        self.assertIn(checks["python_not_debuggable"]["status"], ("pass", "fail"))
+        self.assertIn(checks["developer_mode_off"]["status"], ("pass", "warn"))

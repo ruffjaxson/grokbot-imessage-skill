@@ -41,6 +41,33 @@ def run(command: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, capture_output=True, text=True, check=False)
 
 
+def python_attach_checks(*, skip_codesign: bool) -> dict[str, dict[str, str]]:
+    """The worker holds the gate secrets as an ordinary user process, so its
+    interpreter must not be debuggable by the user."""
+    out: dict[str, dict[str, str]] = {}
+    resolved = run(["/usr/bin/python3", "-I", "-c", "import os, sys; print(os.path.realpath(sys.executable))"])
+    real = resolved.stdout.strip()
+    if resolved.returncode != 0 or not real.startswith("/"):
+        return {"python_not_debuggable": check("fail", "could not resolve the real interpreter")}
+    if not skip_codesign:
+        info = run(["/usr/bin/codesign", "-dv", "--verbose=4", real])
+        ents = run(["/usr/bin/codesign", "-d", "--entitlements", "-", real])
+        text = (info.stderr or "") + (info.stdout or "")
+        apple = "Authority=Software Signing" in text or "Platform identifier" in text
+        debuggable = "get-task-allow" in ((ents.stdout or "") + (ents.stderr or ""))
+        out["python_not_debuggable"] = check(
+            "pass" if apple and not debuggable else "fail",
+            f"{real} apple_signed={apple} get_task_allow={debuggable}",
+        )
+    devtools = run(["/usr/sbin/DevToolsSecurity", "-status"])
+    enabled = "enabled" in (devtools.stdout or "").lower() and "disabled" not in (devtools.stdout or "").lower()
+    out["developer_mode_off"] = check(
+        "warn" if enabled else "pass",
+        "Developer mode is on: debuggers may attach to the helper's Python" if enabled else "Developer mode is off",
+    )
+    return out
+
+
 def inspect_install(args: argparse.Namespace) -> dict[str, Any]:
     bridge = absolute_path_preserving_dotdot(args.bridge)
     code_root = absolute_path_preserving_dotdot(args.code_root or bridge)
@@ -149,6 +176,7 @@ def inspect_install(args: argparse.Namespace) -> dict[str, Any]:
             gate_json.is_file()
             and not has_symlink_component(gate_json)
             and gate_json.stat().st_uid == 0
+            and gate_json.stat().st_nlink == 1
             and mode(gate_json) == 0o600
             and not os.access(gate_json, os.R_OK)
         )
@@ -157,6 +185,14 @@ def inspect_install(args: argparse.Namespace) -> dict[str, Any]:
             f"{gate_json} mode={oct(mode(gate_json)) if gate_json.exists() else 'missing'} "
             f"readable_by_user={os.access(gate_json, os.R_OK) if gate_json.exists() else 'n/a'}",
         )
+
+        # A hard link to the setuid wrapper would outlive reinstalls.
+        wrapper = executable_files["fda_wrapper"]
+        links = wrapper.stat().st_nlink if wrapper.exists() else 0
+        checks["fda_wrapper_single_link"] = check(
+            "pass" if links == 1 else "fail", f"{wrapper} st_nlink={links} (expected 1)"
+        )
+        checks.update(python_attach_checks(skip_codesign=args.skip_codesign))
 
     if not args.skip_codesign:
         for name, path in executable_files.items():

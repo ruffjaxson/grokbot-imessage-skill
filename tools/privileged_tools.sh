@@ -20,4 +20,6 @@ load_privileged_tool_paths() {
     TEE_BIN="$(_privileged_tool_path tee)"
     RM_BIN="$(_privileged_tool_path rm)"
     RMDIR_BIN="$(_privileged_tool_path rmdir)"
+    CLANG_BIN="$(_privileged_tool_path clang)"
+    CODESIGN_BIN="$(_privileged_tool_path codesign)"
 }

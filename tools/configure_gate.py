@@ -61,13 +61,17 @@ def merge(
     gate_url: str | None,
     token: str | None,
     disable: bool,
+    rotate_hmac_key: bool = False,
+    require_new_token: bool = False,
 ) -> dict[str, Any]:
     gate_client = _load_gate_client()
     data = dict(existing)
     data.setdefault("schema_version", 1)
     key = data.get("contact_ref_hmac_key")
-    if not isinstance(key, str) or not key.strip() or key == PLACEHOLDER_KEY:
+    if rotate_hmac_key or not isinstance(key, str) or not key.strip() or key == PLACEHOLDER_KEY:
         data["contact_ref_hmac_key"] = secrets.token_urlsafe(32)
+    if require_new_token and token is not None and token == existing.get("helper_token"):
+        raise SystemExit("refusing: that is the old helper token; issue a new one on the gate")
     if disable:
         data.pop("gate_url", None)
         data.pop("helper_token", None)
@@ -107,6 +111,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--gate-url", help="approval gate origin, e.g. https://host.ts.net")
     parser.add_argument("--token-stdin", action="store_true", help="read the helper token from stdin")
     parser.add_argument("--disable", action="store_true", help="remove the gate section")
+    parser.add_argument("--rotate-hmac-key", action="store_true", help="generate a new contact_ref key")
+    parser.add_argument(
+        "--require-new-token", action="store_true", help="refuse a helper token equal to the current one"
+    )
     args = parser.parse_args(argv)
 
     if args.disable and args.gate_url:
@@ -121,9 +129,18 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("no helper token on stdin")
 
     existing = read_existing(args.gate_json)
-    data = merge(existing, gate_url=args.gate_url, token=token, disable=args.disable)
+    data = merge(
+        existing,
+        gate_url=args.gate_url,
+        token=token,
+        disable=args.disable,
+        rotate_hmac_key=args.rotate_hmac_key,
+        require_new_token=args.require_new_token,
+    )
     write_atomic(args.gate_json, data)
 
+    if args.rotate_hmac_key:
+        print("gate.json: contact_ref key rotated (old refs no longer resolve)", file=sys.stderr)
     if data.get("gate_url"):
         changed = "updated" if args.gate_url else "unchanged"
         print(f"gate.json: approval gate {data['gate_url']} (helper token {changed})", file=sys.stderr)

@@ -45,8 +45,9 @@ GATE_URL_INPUT="${IMESSAGE_GATE_URL:-}"
 GATE_TOKEN_FILE="${IMESSAGE_GATE_TOKEN_FILE:-}"
 GATE_TOKEN_INPUT=""
 CURRENT_USER="$(id -un)"
-BUILD_DIR="$(mktemp -d -t grokbot-imessage-build.XXXXXX)"
-trap 'rm -rf "$BUILD_DIR"' EXIT
+# Root-owned 0700 build area: the setuid wrapper is compiled, signed, and
+# installed as root, never from a directory a user process could write to.
+BUILD_ROOT="$USER_ROOT/build"
 
 if [[ ! -f "$PYTHON_SELECTOR" || -L "$PYTHON_SELECTOR" ]]; then
     echo "Error: missing regular Python selector: $PYTHON_SELECTOR" >&2
@@ -92,6 +93,14 @@ if ! hardened_python_is_trusted "$PYTHON3_PATH"; then
     echo "Error: hardened mode requires a root-owned Python interpreter" >&2
     echo "whose file and parent directories are not symlinks or group/world-writable." >&2
     echo "Use /usr/bin/python3, provide a trusted IMESSAGE_PYTHON path, or run ./install.sh." >&2
+    exit 1
+fi
+# The setuid wrapper execs the real interpreter, not the /usr/bin/python3 xcrun
+# shim, so no per-user xcrun state sits between it and Python.
+REAL_PYTHON="$(env -u DEVELOPER_DIR "$PYTHON3_PATH" -I -c \
+    'import os, sys; print(os.path.realpath(sys.executable))')"
+if [[ "$REAL_PYTHON" != /* ]] || ! hardened_python_is_trusted "$REAL_PYTHON"; then
+    echo "Error: could not resolve a trusted real Python interpreter behind $PYTHON3_PATH" >&2
     exit 1
 fi
 
@@ -142,6 +151,24 @@ if [[ -n "$GATE_URL_INPUT" ]]; then
     fi
     if [[ -z "$GATE_TOKEN_INPUT" ]]; then
         echo "Error: empty approval gate helper token." >&2
+        exit 1
+    fi
+fi
+
+# Upgrading from the layout where gate.json carried a user-read ACL: its helper
+# token and contact-ref key were readable by any process running as you, so
+# both are rotated now. IMESSAGE_GATE_ROTATE=1 forces the same rotation.
+ROTATE_SECRETS=0
+if [[ "${IMESSAGE_GATE_ROTATE:-0}" == "1" ]]; then
+    ROTATE_SECRETS=1
+elif [[ -f "$GATE_JSON" ]] && /bin/ls -le "$GATE_JSON" 2>/dev/null | grep -q "allow read"; then
+    ROTATE_SECRETS=1
+fi
+if [[ "$ROTATE_SECRETS" == "1" ]]; then
+    echo "gate.json secrets will be rotated (new contact-ref key; a new helper token is required)."
+    if [[ -z "$GATE_URL_INPUT" ]] && grep -q '"helper_token"' "$GATE_JSON" 2>/dev/null; then
+        echo "Error: the old helper token was readable by your user. Ask for a new token on the" >&2
+        echo "gate, then rerun with IMESSAGE_GATE_URL=... and IMESSAGE_GATE_TOKEN_FILE=<new token>." >&2
         exit 1
     fi
 fi
@@ -212,12 +239,20 @@ sudo "$INSTALL_BIN" -o root -g wheel -m 444 \
     "$SOURCE_ROOT/bin/gate_client.py" "$GATE_CLIENT_PY"
 sudo "$INSTALL_BIN" -o root -g wheel -m 444 \
     "$CONFIGURE_GATE" "$CONFIGURE_GATE_INSTALLED"
+CONFIGURE_ARGS=(--gate-json "$GATE_JSON")
+if [[ "$ROTATE_SECRETS" == "1" ]]; then
+    CONFIGURE_ARGS+=(--rotate-hmac-key)
+fi
 if [[ -n "$GATE_URL_INPUT" ]]; then
+    CONFIGURE_ARGS+=(--gate-url "$GATE_URL_INPUT" --token-stdin)
+    if [[ "$ROTATE_SECRETS" == "1" ]]; then
+        CONFIGURE_ARGS+=(--require-new-token)
+    fi
     printf '%s\n' "$GATE_TOKEN_INPUT" | sudo "$PYTHON3_PATH" -I "$CONFIGURE_GATE_INSTALLED" \
-        --gate-json "$GATE_JSON" --gate-url "$GATE_URL_INPUT" --token-stdin
+        "${CONFIGURE_ARGS[@]}"
     GATE_TOKEN_INPUT=""
 else
-    sudo "$PYTHON3_PATH" -I "$CONFIGURE_GATE_INSTALLED" --gate-json "$GATE_JSON"
+    sudo "$PYTHON3_PATH" -I "$CONFIGURE_GATE_INSTALLED" "${CONFIGURE_ARGS[@]}"
 fi
 if [[ -e "$GATE_JSON" ]]; then
     sudo "$CHOWN_BIN" root:wheel "$GATE_JSON"
@@ -243,17 +278,27 @@ if ! sudo "$CHMOD_BIN" -N "$GATE_JSON" 2>/dev/null; then
     echo "  no existing ACL to clear on gate.json"
 fi
 
-clang -Wall -Wextra -Werror -fobjc-arc \
-    -framework AppKit -framework Foundation \
-    -o "$BUILD_DIR/grokbot-imessage-confirm" "$SOURCE_ROOT/bin/confirm_imessage_send.m"
+# Stage every trusted source root-owned first; the binaries are built from
+# these copies, so what runs is exactly what was installed.
+for name in helper.py send_gate.py contact_refs.py gate_client.py \
+    imessage_helper.c confirm_imessage_send.m; do
+    sudo "$INSTALL_BIN" -o root -g wheel -m 444 \
+        "$SOURCE_ROOT/bin/$name" "$CODE_ROOT/bin/$name"
+done
 
-clang -Wall -Wextra -Werror -O2 \
+sudo "$RM_BIN" -rf "$BUILD_ROOT"
+sudo "$INSTALL_BIN" -d -o root -g wheel -m 700 "$BUILD_ROOT"
+sudo "$CLANG_BIN" -Wall -Wextra -Werror -fobjc-arc \
+    -framework AppKit -framework Foundation \
+    -o "$BUILD_ROOT/grokbot-imessage-confirm" "$CODE_ROOT/bin/confirm_imessage_send.m"
+sudo "$CLANG_BIN" -Wall -Wextra -Werror -O2 \
     -DHELPER_SCRIPT="\"$CODE_ROOT/bin/helper.py\"" \
     -DSEND_GATE_SCRIPT="\"$CODE_ROOT/bin/send_gate.py\"" \
     -DCONFIRM_HELPER="\"$CODE_ROOT/bin/grokbot-imessage-confirm\"" \
     -DBRIDGE_ROOT="\"$BRIDGE_ROOT\"" \
-    -DPYTHON_INTERPRETER="\"$PYTHON3_PATH\"" \
+    -DPYTHON_INTERPRETER="\"$REAL_PYTHON\"" \
     -DEXPECTED_CODE_UID=0 \
+    -DEXPECTED_USER_UID="$UID" \
     -DREAD_POLICY_MODE='"allowlist"' \
     -DREAD_ALLOWLIST_PATH="\"$ALLOWLIST\"" \
     -DIMESSAGE_GATE_PATH="\"$GATE_JSON\"" \
@@ -263,35 +308,31 @@ clang -Wall -Wextra -Werror -O2 \
     -DREQUIRE_ROOT_POLICY=1 \
     -DHELPER_DISPLAY_NAME='"grokbot-imessage-helper"' \
     -DHOST_DISPLAY_NAME='"Grok Bot"' \
-    -o "$BUILD_DIR/grokbot-imessage-helper" \
-    "$SOURCE_ROOT/bin/imessage_helper.c"
+    -o "$BUILD_ROOT/grokbot-imessage-helper" \
+    "$CODE_ROOT/bin/imessage_helper.c"
 
+# Signed as root too. A non-ad-hoc CODESIGN_IDENTITY must be usable by root.
 CODESIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
 SIGN_ARGS=(--force --sign "$CODESIGN_IDENTITY" --options runtime)
 if [[ "$CODESIGN_IDENTITY" != "-" ]]; then
     SIGN_ARGS+=(--timestamp)
 fi
-codesign "${SIGN_ARGS[@]}" "$BUILD_DIR/grokbot-imessage-helper"
-codesign "${SIGN_ARGS[@]}" "$BUILD_DIR/grokbot-imessage-confirm"
+sudo "$CODESIGN_BIN" "${SIGN_ARGS[@]}" "$BUILD_ROOT/grokbot-imessage-helper"
+sudo "$CODESIGN_BIN" "${SIGN_ARGS[@]}" "$BUILD_ROOT/grokbot-imessage-confirm"
 
-sudo "$INSTALL_BIN" -o root -g wheel -m 444 \
-    "$SOURCE_ROOT/bin/helper.py" "$CODE_ROOT/bin/helper.py"
-sudo "$INSTALL_BIN" -o root -g wheel -m 444 \
-    "$SOURCE_ROOT/bin/send_gate.py" "$CODE_ROOT/bin/send_gate.py"
-sudo "$INSTALL_BIN" -o root -g wheel -m 444 \
-    "$SOURCE_ROOT/bin/contact_refs.py" "$CODE_ROOT/bin/contact_refs.py"
-sudo "$INSTALL_BIN" -o root -g wheel -m 444 \
-    "$SOURCE_ROOT/bin/gate_client.py" "$GATE_CLIENT_PY"
-sudo "$INSTALL_BIN" -o root -g wheel -m 444 \
-    "$SOURCE_ROOT/bin/imessage_helper.c" "$CODE_ROOT/bin/imessage_helper.c"
-sudo "$INSTALL_BIN" -o root -g wheel -m 444 \
-    "$SOURCE_ROOT/bin/confirm_imessage_send.m" "$CODE_ROOT/bin/confirm_imessage_send.m"
+# Clear the setuid bit on the old wrapper's inode before replacing it, so a
+# hard link someone made to it can't keep a setuid copy alive.
+WRAPPER_DEST="$CODE_ROOT/bin/grokbot-imessage-helper"
+if [[ -f "$WRAPPER_DEST" && ! -L "$WRAPPER_DEST" ]]; then
+    sudo "$CHMOD_BIN" 0555 "$WRAPPER_DEST"
+fi
 # setuid root: only to read the root-only gate.json before irrevocably
 # dropping to the invoking user (see GATE_SECRETS_VIA_FD in imessage_helper.c).
 sudo "$INSTALL_BIN" -o root -g wheel -m 4555 \
-    "$BUILD_DIR/grokbot-imessage-helper" "$CODE_ROOT/bin/grokbot-imessage-helper"
+    "$BUILD_ROOT/grokbot-imessage-helper" "$WRAPPER_DEST"
 sudo "$INSTALL_BIN" -o root -g wheel -m 555 \
-    "$BUILD_DIR/grokbot-imessage-confirm" "$CODE_ROOT/bin/grokbot-imessage-confirm"
+    "$BUILD_ROOT/grokbot-imessage-confirm" "$CODE_ROOT/bin/grokbot-imessage-confirm"
+sudo "$RM_BIN" -rf "$BUILD_ROOT"
 sudo "$INSTALL_BIN" -o root -g wheel -m 555 \
     "$SOURCE_ROOT/tools/doctor.py" "$CODE_ROOT/tools/doctor.py"
 sudo "$INSTALL_BIN" -o root -g wheel -m 555 \

@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -108,6 +109,12 @@ extern int _NSGetExecutablePath(char *buf, uint32_t *bufsize);
 #endif
 
 #define GATE_SECRETS_MAX_BYTES 8192
+
+/* The only uid allowed to run the setuid wrapper (baked by the installer).
+ * -1 disables the check (non-setuid test builds). */
+#ifndef EXPECTED_USER_UID
+#define EXPECTED_USER_UID -1L
+#endif
 
 #ifndef REQUIRE_ROOT_POLICY
 #define REQUIRE_ROOT_POLICY 0
@@ -559,6 +566,39 @@ static int set_env_value(char *buffer, size_t size, const char *name,
 #error "GATE_SECRETS_VIA_FD requires IMESSAGE_GATE_PATH"
 #endif
 
+static void secure_zero(void *ptr, size_t len) {
+#if defined(__APPLE__)
+    memset_s(ptr, len, 0, len);
+#else
+    volatile unsigned char *p = (volatile unsigned char *)ptr;
+    while (len--) {
+        *p++ = 0;
+    }
+#endif
+}
+
+/* No core files: once the worker holds the secrets its saved uid equals the
+ * user's, so a dump would be user-readable. A lowered hard limit can't be
+ * raised again without root. */
+static int disable_core_dumps(void) {
+    struct rlimit none = {0, 0};
+    if (setrlimit(RLIMIT_CORE, &none) != 0) {
+        fprintf(stderr, "%s: cannot disable core dumps (%s)\n", HELPER_DISPLAY_NAME,
+                strerror(errno));
+        return 1;
+    }
+    return 0;
+}
+
+static int require_expected_user(void) {
+    if (EXPECTED_USER_UID >= 0 && getuid() != (uid_t)EXPECTED_USER_UID) {
+        fprintf(stderr, "%s: this helper belongs to uid %ld; refusing uid %u\n",
+                HELPER_DISPLAY_NAME, (long)EXPECTED_USER_UID, (unsigned int)getuid());
+        return 12;
+    }
+    return 0;
+}
+
 /* A setuid program started with fd 0-2 closed would otherwise hand those
  * numbers to the next open(). */
 static int ensure_standard_fds(void) {
@@ -582,6 +622,12 @@ static int read_gate_secrets_into_pipe(int *read_fd) {
     struct stat st;
     if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
         fprintf(stderr, "%s: gate config is not a regular file; refusing\n",
+                HELPER_DISPLAY_NAME);
+        close(fd);
+        return 3;
+    }
+    if (st.st_nlink != 1) {
+        fprintf(stderr, "%s: gate config has extra hard links; refusing\n",
                 HELPER_DISPLAY_NAME);
         close(fd);
         return 3;
@@ -647,7 +693,7 @@ static int read_gate_secrets_into_pipe(int *read_fd) {
             close(fds[0]);
         }
     }
-    memset_s(buffer, sizeof(buffer), 0, sizeof(buffer));
+    secure_zero(buffer, sizeof(buffer));
     return result;
 }
 
@@ -987,8 +1033,12 @@ int main(int argc, char **argv) {
 
 #if GATE_SECRETS_VIA_FD
     /* Privileged section: nothing user-controlled is read before the drop. */
-    if (ensure_standard_fds() != 0) {
+    if (disable_core_dumps() != 0 || ensure_standard_fds() != 0) {
         return 1;
+    }
+    int user_status = require_expected_user();
+    if (user_status != 0) {
+        return user_status;
     }
     int gate_secrets_fd = -1;
     int secrets_status = read_gate_secrets_into_pipe(&gate_secrets_fd);

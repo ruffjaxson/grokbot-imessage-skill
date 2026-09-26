@@ -37,6 +37,11 @@ if [[ -d "$SKILL_DEST" ]]; then
     echo "  removed Grok skill $SKILL_DEST"
 fi
 if [[ -d "$USER_ROOT" ]]; then
+    # Clear the setuid bit first so hard links to the wrapper lose it too.
+    wrapper="$USER_ROOT/libexec/bin/grokbot-imessage-helper"
+    if [[ -f "$wrapper" && ! -L "$wrapper" ]]; then
+        sudo "$CHMOD_BIN" 0555 "$wrapper"
+    fi
     sudo "$RM_BIN" -rf "$USER_ROOT"
     echo "  removed root-owned helper $USER_ROOT"
     if sudo "$RMDIR_BIN" "$PRODUCT_ROOT/users" 2>/dev/null; then
