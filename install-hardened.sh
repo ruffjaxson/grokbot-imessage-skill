@@ -95,14 +95,7 @@ if ! hardened_python_is_trusted "$PYTHON3_PATH"; then
     echo "Use /usr/bin/python3, provide a trusted IMESSAGE_PYTHON path, or run ./install.sh." >&2
     exit 1
 fi
-# The setuid wrapper execs the real interpreter, not the /usr/bin/python3 xcrun
-# shim, so no per-user xcrun state sits between it and Python.
-REAL_PYTHON="$(env -u DEVELOPER_DIR "$PYTHON3_PATH" -I -c \
-    'import os, sys; print(os.path.realpath(sys.executable))')"
-if [[ "$REAL_PYTHON" != /* ]] || ! hardened_python_is_trusted "$REAL_PYTHON"; then
-    echo "Error: could not resolve a trusted real Python interpreter behind $PYTHON3_PATH" >&2
-    exit 1
-fi
+PYTHON_RECORD="$CODE_ROOT/python-interpreter"
 
 for path in \
     "$SOURCE_ROOT/bin/helper.py" \
@@ -164,6 +157,11 @@ if [[ "${IMESSAGE_GATE_ROTATE:-0}" == "1" ]]; then
 elif [[ -f "$GATE_JSON" ]] && /bin/ls -le "$GATE_JSON" 2>/dev/null | grep -q "allow read"; then
     ROTATE_SECRETS=1
 fi
+if [[ "${IMESSAGE_GATE_ROTATE:-0}" == "1" && -z "$GATE_URL_INPUT" ]]; then
+    echo "Error: IMESSAGE_GATE_ROTATE=1 needs a new helper token: set IMESSAGE_GATE_URL and" >&2
+    echo "IMESSAGE_GATE_TOKEN_FILE (the root-only gate.json is checked again as root)." >&2
+    exit 1
+fi
 if [[ "$ROTATE_SECRETS" == "1" ]]; then
     echo "gate.json secrets will be rotated (new contact-ref key; a new helper token is required)."
     if [[ -z "$GATE_URL_INPUT" ]] && grep -q '"helper_token"' "$GATE_JSON" 2>/dev/null; then
@@ -201,6 +199,28 @@ chmod 600 "$BRIDGE_ROOT/contacts/blocked_chats.txt" \
 
 echo "Requesting administrator access for the root-owned code and policy..."
 sudo -v
+
+# The setuid wrapper execs the real interpreter, not the /usr/bin/python3 xcrun
+# shim. Resolve it as root with an empty environment (no DEVELOPER_DIR or other
+# user state), and accept only a binary inside the selected developer tools.
+REAL_PYTHON="$(sudo "$ENV_BIN" -i "$PYTHON3_PATH" -I -c \
+    'import os, sys; print(os.path.realpath(sys.executable))')"
+DEVELOPER_ROOT="$(sudo "$ENV_BIN" -i /usr/bin/xcode-select -p)"
+if [[ "$DEVELOPER_ROOT" != /?* ]]; then
+    echo "Error: xcode-select -p returned no developer directory; refusing" >&2
+    exit 1
+fi
+case "$REAL_PYTHON" in
+    /usr/bin/*|"")
+        echo "Error: resolved interpreter is the xcrun shim ($REAL_PYTHON); refusing" >&2
+        exit 1
+        ;;
+esac
+if [[ "$REAL_PYTHON" != "$DEVELOPER_ROOT"/* && "$REAL_PYTHON" != /Library/Developer/CommandLineTools/* ]] ||
+    ! _imessage_python_is_supported "$REAL_PYTHON" || ! hardened_python_is_trusted "$REAL_PYTHON"; then
+    echo "Error: $REAL_PYTHON is not a trusted, supported Apple developer-tools Python" >&2
+    exit 1
+fi
 sudo "$INSTALL_BIN" -d -o root -g wheel -m 755 \
     "$PRODUCT_ROOT" "$PRODUCT_ROOT/users" "$USER_ROOT" "$CODE_ROOT" \
     "$CODE_ROOT/bin" "$CODE_ROOT/tools" "$CONFIG_ROOT"
@@ -333,6 +353,10 @@ sudo "$INSTALL_BIN" -o root -g wheel -m 4555 \
 sudo "$INSTALL_BIN" -o root -g wheel -m 555 \
     "$BUILD_ROOT/grokbot-imessage-confirm" "$CODE_ROOT/bin/grokbot-imessage-confirm"
 sudo "$RM_BIN" -rf "$BUILD_ROOT"
+# doctor.py checks the interpreter the wrapper actually execs.
+sudo "$INSTALL_BIN" -o root -g wheel -m 444 /dev/null "$PYTHON_RECORD.tmp"
+printf '%s\n' "$REAL_PYTHON" | sudo "$TEE_BIN" "$PYTHON_RECORD.tmp" > /dev/null
+sudo "$MV_BIN" -f "$PYTHON_RECORD.tmp" "$PYTHON_RECORD"
 sudo "$INSTALL_BIN" -o root -g wheel -m 555 \
     "$SOURCE_ROOT/tools/doctor.py" "$CODE_ROOT/tools/doctor.py"
 sudo "$INSTALL_BIN" -o root -g wheel -m 555 \

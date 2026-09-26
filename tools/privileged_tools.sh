@@ -22,4 +22,6 @@ load_privileged_tool_paths() {
     RMDIR_BIN="$(_privileged_tool_path rmdir)"
     CLANG_BIN="$(_privileged_tool_path clang)"
     CODESIGN_BIN="$(_privileged_tool_path codesign)"
+    ENV_BIN="$(_privileged_tool_path env)"
+    MV_BIN="$(_privileged_tool_path mv)"
 }

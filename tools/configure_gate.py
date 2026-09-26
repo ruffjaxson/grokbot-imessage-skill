@@ -72,6 +72,9 @@ def merge(
         data["contact_ref_hmac_key"] = secrets.token_urlsafe(32)
     if require_new_token and token is not None and token == existing.get("helper_token"):
         raise SystemExit("refusing: that is the old helper token; issue a new one on the gate")
+    if rotate_hmac_key and existing.get("helper_token") and token is None and not disable:
+        # Checked here, as root: the user can't read the root-only file.
+        raise SystemExit("refusing: rotating secrets needs a new helper token (--gate-url --token-stdin)")
     if disable:
         data.pop("gate_url", None)
         data.pop("helper_token", None)

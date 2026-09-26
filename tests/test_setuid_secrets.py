@@ -239,6 +239,25 @@ class InstallerSetuidTests(unittest.TestCase):
         self.assertIn("os.path.realpath(sys.executable)", self.script)
         self.assertIn('hardened_python_is_trusted "$REAL_PYTHON"', self.script)
 
+    def test_real_python_is_resolved_as_root_with_an_empty_environment(self) -> None:
+        resolve = self.script.index('REAL_PYTHON="$(sudo "$ENV_BIN" -i "$PYTHON3_PATH" -I -c')
+        self.assertLess(self.script.index("sudo -v"), resolve)
+        self.assertIn('DEVELOPER_ROOT="$(sudo "$ENV_BIN" -i /usr/bin/xcode-select -p)"', self.script)
+        self.assertIn('if [[ "$DEVELOPER_ROOT" != /?* ]]; then', self.script)
+        self.assertIn("/usr/bin/*|\"\")", self.script)
+        self.assertIn('"$REAL_PYTHON" != "$DEVELOPER_ROOT"/*', self.script)
+        self.assertIn('_imessage_python_is_supported "$REAL_PYTHON"', self.script)
+        self.assertLess(resolve, self.script.index('-DPYTHON_INTERPRETER="\\"$REAL_PYTHON\\""'))
+
+    def test_baked_interpreter_is_recorded_root_owned_for_doctor(self) -> None:
+        self.assertIn('PYTHON_RECORD="$CODE_ROOT/python-interpreter"', self.script)
+        self.assertIn('sudo "$INSTALL_BIN" -o root -g wheel -m 444 /dev/null "$PYTHON_RECORD.tmp"', self.script)
+        self.assertIn('sudo "$MV_BIN" -f "$PYTHON_RECORD.tmp" "$PYTHON_RECORD"', self.script)
+
+    def test_forced_rotation_needs_a_new_token_up_front(self) -> None:
+        guard = self.script.index('if [[ "${IMESSAGE_GATE_ROTATE:-0}" == "1" && -z "$GATE_URL_INPUT" ]]; then')
+        self.assertLess(guard, self.script.index("sudo -v"))
+
     def test_setuid_bit_cleared_before_replace_and_uninstall(self) -> None:
         chmod = self.script.index('sudo "$CHMOD_BIN" 0555 "$WRAPPER_DEST"')
         self.assertLess(chmod, self.script.index('-m 4555 \\\n    "$BUILD_ROOT/grokbot-imessage-helper"'))
@@ -275,11 +294,17 @@ class ConfigureGateRotationTests(unittest.TestCase):
         with mock.patch.object(sys, "stdin", io.StringIO(stdin)), redirect_stderr(io.StringIO()):
             return self.tool.main(["--gate-json", str(self.path), *argv])
 
-    def test_rotates_hmac_key_and_keeps_token(self) -> None:
+    def test_rotation_refuses_to_keep_the_old_token(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "needs a new helper token"):
+            self.run_tool(["--rotate-hmac-key"])
+        self.assertEqual(json.loads(self.path.read_text()), GATE)
+
+    def test_rotation_without_a_token_on_file_only_rotates_the_key(self) -> None:
+        self.path.write_text(json.dumps({k: v for k, v in GATE.items() if k != "helper_token"}))
         self.run_tool(["--rotate-hmac-key"])
         data = json.loads(self.path.read_text())
         self.assertNotEqual(data["contact_ref_hmac_key"], GATE["contact_ref_hmac_key"])
-        self.assertEqual(data["helper_token"], GATE["helper_token"])
+        self.assertNotIn("helper_token", data)
 
     def test_require_new_token_refuses_the_old_one(self) -> None:
         with self.assertRaises(SystemExit):
