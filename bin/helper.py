@@ -1633,8 +1633,10 @@ def action_contacts_lookup(params, conn, contacts, privacy_policy):
     nl = name.lower()
     matches = []
     for handle, full_name in contacts.items():
-        # Manager role: unfiltered contacts
-        if bridge_role() != "manager" and not is_read_allowed(handle, handle, privacy_policy):
+        # Allowlist gates message reads, not contact discovery. Users need
+        # contacts_lookup to resolve names before send/chat_history; an empty
+        # hardened allowlist must not hide every contact. Blocklist still applies.
+        if bridge_role() != "manager" and is_blocked(handle, handle, privacy_policy):
             continue
         if nl in full_name.lower():
             if "@" in handle:
