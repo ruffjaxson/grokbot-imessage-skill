@@ -128,6 +128,12 @@ print(module.ALLOWLIST_PATH)
             allowlist=("alice@example.com",),
             blocklist=(),
         )
+        helper._CONTACT_HANDLE_LABELS.update(
+            {
+                "alice@example.com": "email 1",
+                "bob@example.com": "email 1",
+            }
+        )
         result = helper.action_contacts_lookup(
             {"name": "Example"},
             None,
@@ -137,8 +143,8 @@ print(module.ALLOWLIST_PATH)
         self.assertEqual(
             result["matches"],
             [
-                _match("Alice Example", "alice@example.com"),
-                _match("Bob Example", "bob@example.com"),
+                _match("Alice Example", "alice@example.com", "email 1"),
+                _match("Bob Example", "bob@example.com", "email 1"),
             ],
         )
 
@@ -164,8 +170,9 @@ print(module.ALLOWLIST_PATH)
             {"alice@example.com": "Alice Example", "bob@example.com": "Bob Example"},
             policy,
         )
+        helper._CONTACT_HANDLE_LABELS["alice@example.com"] = "email 1"
         self.assertEqual(
-            result["matches"], [_match("Alice Example", "alice@example.com")]
+            result["matches"], [_match("Alice Example", "alice@example.com", "email 1")]
         )
 
     def test_email_entries_match_exactly(self) -> None:

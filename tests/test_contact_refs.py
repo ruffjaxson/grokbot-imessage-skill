@@ -21,18 +21,38 @@ _spec.loader.exec_module(contact_refs)
 TEST_KEY = b"test-hmac-key"
 
 
-def _match(name: str, handle: str) -> dict[str, str]:
-    return contact_refs.lookup_match(handle, name, key=TEST_KEY)
+def _match(name: str, handle: str, label: str = "mobile") -> dict[str, str]:
+    return contact_refs.lookup_match(handle, name, label, key=TEST_KEY)
 
 
-class ContactRefMaskingTests(unittest.TestCase):
-    def test_mask_phone_and_email(self) -> None:
-        self.assertEqual(contact_refs.mask_handle("4155551234"), "***-***-1234")
+class ContactRefLookupTests(unittest.TestCase):
+    def test_decode_addressbook_label(self) -> None:
+        self.assertEqual(helper._decode_addressbook_label("_$!<Mobile>!$_"), "mobile")
+        self.assertEqual(helper._decode_addressbook_label("Home"), "home")
+        self.assertEqual(helper._decode_addressbook_label(None), "")
+
+    def test_lookup_match_fields(self) -> None:
+        match = _match("Emma Ruff", "4155551234", "mobile")
         self.assertEqual(
-            contact_refs.mask_handle("emma@example.com"), "e***@example.com"
+            match,
+            {
+                "name": "Emma Ruff",
+                "service": "iMessage",
+                "label": "mobile",
+                "contact_ref": contact_refs.make_contact_ref("4155551234", TEST_KEY),
+            },
         )
+        email_match = _match("Emma Ruff", "emma@example.com", "email 1")
+        self.assertEqual(email_match["service"], "email")
+        self.assertEqual(email_match["label"], "email 1")
 
     def test_contacts_lookup_never_returns_raw_handles(self) -> None:
+        helper._CONTACT_HANDLE_LABELS.update(
+            {
+                "4155551234": "mobile",
+                "emma@example.com": "email 1",
+            }
+        )
         contacts = {
             "4155551234": "Emma Ruff",
             "emma@example.com": "Emma Ruff",
@@ -50,10 +70,10 @@ class ContactRefMaskingTests(unittest.TestCase):
         self.assertNotIn("+14155551234", blob)
         self.assertNotIn("emma@example.com", blob)
         self.assertNotIn("phone_last10", blob)
-        self.assertIn("e***@example.com", blob)
+        self.assertNotIn("masked_handle", blob)
         self.assertEqual(result["match_count"], 2)
         for match in result["matches"]:
-            self.assertIn("masked_handle", match)
+            self.assertIn("label", match)
             self.assertIn("contact_ref", match)
             self.assertIn("service", match)
             self.assertRegex(match["contact_ref"], r"^[0-9a-f]{64}$")
@@ -92,7 +112,8 @@ class ContactRefRoundTripTests(unittest.TestCase):
     def test_ref_round_trip_and_send_preview(self) -> None:
         contacts = {"4155551234": "Emma Ruff"}
         helper._CONTACT_RAW_HANDLES["4155551234"] = "+14155551234"
-        match = _match("Emma Ruff", "4155551234")
+        helper._CONTACT_HANDLE_LABELS["4155551234"] = "mobile"
+        match = _match("Emma Ruff", "4155551234", "mobile")
         normalized = contact_refs.resolve_contact_ref(match["contact_ref"], contacts, key=TEST_KEY)
         self.assertEqual(normalized, "4155551234")
         self.assertEqual(helper.contact_raw_handle(normalized), "+14155551234")
@@ -104,8 +125,9 @@ class ContactRefRoundTripTests(unittest.TestCase):
                 contacts,
                 helper.PrivacyPolicy(mode="blocklist", blocklist=(), allowlist=()),
             )
-        self.assertEqual(preview["preview"]["masked_handle"], "***-***-1234")
+        self.assertEqual(preview["preview"]["label"], "mobile")
         self.assertEqual(preview["preview"]["contact_ref"], match["contact_ref"])
+        self.assertNotIn("masked_handle", preview["preview"])
         self.assertNotIn("to", preview["preview"])
         self.assertNotIn("+14155551234", json.dumps(preview))
 
