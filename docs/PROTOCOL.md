@@ -661,7 +661,7 @@ creates no approval.
 required: `"30m"`, `"12h"`, `"1d"`, `"1w"`, a number of seconds (minimum 60,
 maximum a year), or `"always"`. For `read`/`watch`, `lookback` is one of
 `grant_time` (default), `7d`, `30d`, or `all`. Presets replace `scopes`/`duration`:
-`{"preset": "trusted"}` (permanent send + read, lookback default `all`; add
+`{"preset": "trusted"}` (permanent send + read, lookback default `grant_time`; add
 `"scopes": ["watch"]` to include watch) and `{"preset": "standard", "duration": "1d"|"1w"}`
 (send only). The approver can choose a different preset or lookback. Returns
 `pending_approval` with `approve_url`, like `send`.

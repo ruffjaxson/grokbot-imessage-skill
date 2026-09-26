@@ -111,7 +111,8 @@ When the user asks for standing access, use `request_grant` with a preset when o
 
 - **Trusted** ("Emma can have full access", "text and read Emma anytime"):
   `{"contact_ref": "…", "preset": "trusted"}` gives permanent send + read. `lookback`
-  defaults to `"all"` history; pass `"lookback": "30d"` etc. if the user limits it.
+  defaults to `"grant_time"` (only new messages); pass `"30d"` or `"all"` only if the user
+  asked for past messages. The user can also widen it on the phone.
 - **Standard** ("you can text Emma without asking this week"):
   `{"contact_ref": "…", "preset": "standard", "duration": "1w"}` gives send only, for `"1d"`
   (default) or `"1w"`. Reading needs its own request.
@@ -154,7 +155,8 @@ around it.
   - Saving grants nothing, and approvals for that contact are flagged "Added by Grok" on the
     phone.
   - Only save a name the user gave you. Never invent one or take it from the message text.
-  - It refuses numbers already in Contacts. You can't edit existing contacts.
+  - It refuses numbers already in Contacts, and names that match an existing contact.
+    You can't edit existing contacts.
 
 ## When the watch routine runs
 

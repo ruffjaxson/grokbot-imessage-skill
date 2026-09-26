@@ -149,15 +149,24 @@ confirmation dialog:
   expiring) come from the gate. Anything not granted becomes an approval that
   only a passkey on the owner's phone can approve. The local blocklist still
   wins.
-- **Secrets are root-only.** `gate.json` (helper token and contact-ref HMAC key)
-  is root-owned, mode 600, with no user ACL, so no process running as your user
-  can read it.
+- **Secrets are root-only on disk.** `gate.json` (helper token and contact-ref HMAC
+  key) is root-owned, mode 600, single-link, with no user ACL, so no process running
+  as your user can read the file.
   - The FDA wrapper is installed **setuid root**. It reads `gate.json` first,
     before any other work, and copies it into a pipe.
   - It then irrevocably drops to your uid/gid, confirming that `setuid(0)` now
     fails, before it validates anything else or execs Python.
   - The worker reads the secrets from the inherited pipe (`IMESSAGE_GATE_SECRETS_FD`)
     and closes it.
+  - The wrapper is built and signed as root in a root-only directory. It runs only
+    for the installing user's uid, sets `RLIMIT_CORE` to 0, and execs the real
+    interpreter rather than the `/usr/bin/python3` shim.
+  - **Residual risk:** after the drop, the worker is an ordinary process running
+    as you and holds the secrets in memory. On this setup the interpreter is
+    Apple-signed without `get-task-allow`, and with Developer Mode off both `lldb`
+    and `task_for_pid` are refused for a normal user. Keep Developer Mode off;
+    `doctor.py` warns if it's on. A root broker would remove this residual risk
+    entirely.
   - Without the token, a same-user process can't query the gate directly. Without
     the key, it can't reverse `contact_ref`/`thread_ref` values into numbers.
 - **The helper token cannot approve or grant, even if leaked.** With it, a process
