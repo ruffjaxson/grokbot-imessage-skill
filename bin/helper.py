@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import fcntl
 import glob
+import hmac
 import json
 import os
 import re
@@ -37,8 +38,8 @@ import traceback
 import uuid
 from collections import defaultdict
 from contextlib import contextmanager
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -100,6 +101,14 @@ CONTACT_REFS_PATH = Path(
         )
     )
 )
+GATE_CLIENT_PATH = Path(
+    os.path.abspath(
+        os.path.expanduser(
+            os.environ.get("IMESSAGE_GATE_CLIENT_PATH")
+            or str(CODE_ROOT / "bin" / "gate_client.py")
+        )
+    )
+)
 CONFIRM_HELPER_PATH = Path(
     os.path.abspath(
         os.path.expanduser(
@@ -108,6 +117,7 @@ CONFIRM_HELPER_PATH = Path(
         )
     )
 )
+WATCH_STATE_PATH = BRIDGE_ROOT / "state" / "watch.json"
 CHAT_DB_PATH = Path.home() / "Library" / "Messages" / "chat.db"
 HOST_DISPLAY_NAME = os.environ.get("IMESSAGE_HOST_DISPLAY_NAME", "Grok Bot")
 PRODUCT_ID = os.environ.get("IMESSAGE_PRODUCT_ID", "grokbot-imessage")
@@ -122,7 +132,7 @@ _PRODUCT_ENV_VARS = (
 WRAPPER_MODE = "product" if any(v in os.environ for v in _PRODUCT_ENV_VARS) else "baked"
 
 HELPER_VERSION = "1.4.8"
-PROTOCOL_VERSION = "1.2"
+PROTOCOL_VERSION = "1.3"
 
 # Bridge role. The DIY install and every host bridge run as "host". A
 # management bridge (product mode, IMESSAGE_BRIDGE_ROLE=manager) is the only
@@ -140,6 +150,13 @@ _HOST_ACTIONS = (
     "contacts_lookup",
     "send_preview",
     "send",
+    "send_commit",
+    "request_grant",
+    "approval_status",
+    "list_grants",
+    "revoke_grant",
+    "inbox",
+    "watch_tick",
 )
 _MANAGER_ACTIONS = ("status", "contacts_lookup", "list_chats")
 ROLE_ACTIONS: dict[str, tuple[str, ...]] = {
@@ -198,6 +215,37 @@ def _load_contact_refs():
     spec = _importlib_util.spec_from_file_location("contact_refs", CONTACT_REFS_PATH)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"failed to load contact_refs from {CONTACT_REFS_PATH}")
+    mod = _importlib_util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _load_gate_client():
+    """Loaded only when gate.json configures a gate, so legacy and product
+    installs without gate_client.py are unaffected."""
+    try:
+        metadata = GATE_CLIENT_PATH.lstat()
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError(f"gate_client must be a regular file: {GATE_CLIENT_PATH}")
+        if metadata.st_uid != 0 and metadata.st_uid != os.getuid():
+            raise RuntimeError(
+                f"gate_client must be owned by root or current user: {GATE_CLIENT_PATH}"
+            )
+        if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise RuntimeError(
+                f"gate_client must not be group/world-writable: {GATE_CLIENT_PATH}"
+            )
+        if (
+            os.environ.get("COWORK_IMESSAGE_REQUIRE_ROOT_POLICY") == "1"
+            and metadata.st_uid != 0
+        ):
+            raise RuntimeError(f"gate_client must be root-owned: {GATE_CLIENT_PATH}")
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"gate_client not found: {GATE_CLIENT_PATH}") from exc
+
+    spec = _importlib_util.spec_from_file_location("gate_client", GATE_CLIENT_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"failed to load gate_client from {GATE_CLIENT_PATH}")
     mod = _importlib_util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -837,6 +885,34 @@ class PrivacyPolicy:
     mode: str
     blocklist: tuple[str, ...]
     allowlist: tuple[str, ...]
+    # "local": allowlist/blocklist files. "gate": grants from the approval gate,
+    # where `allowlist` holds the read-scoped handles.
+    source: str = "local"
+    read: tuple[str, ...] = ()
+    watch: tuple[str, ...] = ()
+    send: tuple[str, ...] = ()
+    grants: tuple[Any, ...] = field(default=(), compare=False, hash=False)
+    gate_error: str | None = None
+
+
+GRANT_SCOPES = ("send", "read", "watch")
+
+
+def scoped_policy(policy: PrivacyPolicy | list[str], scope: str) -> PrivacyPolicy:
+    """Gate mode: restrict reads to handles holding `scope`. Local mode: unchanged."""
+    resolved = _coerce_policy(policy)
+    if resolved.source != "gate":
+        return resolved
+    return replace(resolved, mode="allowlist", allowlist=getattr(resolved, scope))
+
+
+def grant_scopes_for(handle: str, policy: PrivacyPolicy | list[str]) -> list[str]:
+    resolved = _coerce_policy(policy)
+    return sorted(
+        scope
+        for scope in GRANT_SCOPES
+        if _matches_list(handle, handle, getattr(resolved, scope))
+    )
 
 
 def _load_list(path: Path, require_root_owner: bool = False, require_uid_owner: bool = False) -> tuple[str, ...]:
@@ -875,10 +951,127 @@ def _load_list(path: Path, require_root_owner: bool = False, require_uid_owner: 
     return tuple(out)
 
 
+@dataclass
+class GateContext:
+    """client is set when gate mode works; error is set when gate.json asks
+    for a gate that can't be used. Either one means gate mode is on."""
+
+    client: Any = None
+    error: str | None = None
+    module: Any = None
+
+    @property
+    def enabled(self) -> bool:
+        return self.client is not None or self.error is not None
+
+    @property
+    def errors(self) -> tuple[type[BaseException], ...]:
+        if self.module is None:
+            return ()
+        return (self.module.GateUnavailable, self.module.GateError)
+
+
+_GATE_CONTEXT: GateContext | None = None
+
+
+def _build_gate_context() -> GateContext:
+    if bridge_role() == "manager":
+        return GateContext()
+    try:
+        data = _contact_refs.load_gate_config()
+    except _contact_refs.ContactRefError as exc:
+        log(f"gate: gate.json unavailable ({exc}); gate mode off")
+        return GateContext()
+    if not data.get("gate_url") and not data.get("helper_token"):
+        return GateContext()
+    try:
+        module = _load_gate_client()
+        config = module.config_from_gate_json(data)
+    except Exception as exc:
+        log(f"gate: misconfigured, failing closed: {exc}")
+        return GateContext(error=f"gate misconfigured: {exc}")
+    return GateContext(client=module.GateClient(config), module=module)
+
+
+def gate_context() -> GateContext:
+    global _GATE_CONTEXT
+    if _GATE_CONTEXT is None:
+        _GATE_CONTEXT = _build_gate_context()
+    return _GATE_CONTEXT
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _normalize_grants(raw: list[Any]) -> tuple[dict[str, Any], ...]:
+    now = datetime.now(timezone.utc)
+    grants = []
+    for g in raw:
+        if not isinstance(g, dict):
+            continue
+        handle, scope, gid = g.get("handle"), g.get("scope"), g.get("id")
+        if not isinstance(handle, str) or not handle or scope not in GRANT_SCOPES:
+            continue
+        if isinstance(gid, bool) or not isinstance(gid, int):
+            continue
+        expires = g.get("expires_at")
+        if expires is not None:
+            parsed = _parse_iso(expires)
+            if parsed is None or parsed <= now:
+                continue
+        grants.append(
+            {
+                "id": gid,
+                "handle": handle,
+                "display_name": str(g.get("display_name") or ""),
+                "scope": scope,
+                "expires_at": expires,
+            }
+        )
+    return tuple(grants)
+
+
+def load_gate_policy(ctx: GateContext) -> PrivacyPolicy:
+    """Fail closed: any gate problem yields a policy with no grants."""
+    blocklist = _load_list(BLOCKLIST_PATH, require_uid_owner=WRAPPER_MODE == "product")
+    closed = PrivacyPolicy(mode="allowlist", blocklist=blocklist, allowlist=(), source="gate")
+    if ctx.error:
+        return replace(closed, gate_error=ctx.error)
+    try:
+        data = ctx.client.policy()
+    except ctx.errors as exc:
+        log(f"gate: policy fetch failed, failing closed: {exc}")
+        return replace(closed, gate_error=str(exc))
+    grants = _normalize_grants(data["grants"])
+    by_scope = {
+        scope: tuple(g["handle"] for g in grants if g["scope"] == scope)
+        for scope in GRANT_SCOPES
+    }
+    return replace(
+        closed,
+        allowlist=by_scope["read"],
+        read=by_scope["read"],
+        watch=by_scope["watch"],
+        send=by_scope["send"],
+        grants=grants,
+    )
+
+
 def load_privacy_policy() -> PrivacyPolicy:
     # Manager role: no policy files loaded
     if bridge_role() == "manager":
         return PrivacyPolicy(mode="blocklist", blocklist=(), allowlist=())
+
+    ctx = gate_context()
+    if ctx.enabled:
+        return load_gate_policy(ctx)
 
     mode_override = os.environ.get("COWORK_IMESSAGE_READ_POLICY", "runtime")
     if mode_override in ("allowlist", "blocklist"):
@@ -1632,7 +1825,7 @@ def action_review(params, conn, contacts, privacy_policy):
     days = validate_days(params.get("days", 2))
     cutoff_ns = to_apple_ns(time.time() - days * 86400)
     msgs = fetch_messages(conn, cutoff_ns)
-    msgs = apply_read_policy(msgs, privacy_policy)
+    msgs = apply_read_policy(msgs, scoped_policy(privacy_policy, "watch"))
     participants = load_chat_participants(conn)
     needs_reply, low_priority, skip = classify_chats(msgs, contacts, participants)
     return {
@@ -1759,6 +1952,8 @@ def action_contacts_lookup(params, conn, contacts, privacy_policy):
     if not isinstance(name, str) or not name.strip() or len(name) > 100:
         raise ValueError("name must be a 1..100 char string")
     nl = name.lower()
+    policy = _coerce_policy(privacy_policy)
+    gate_mode = policy.source == "gate"
     matches = []
     for handle, full_name in contacts.items():
         # Allowlist gates message reads, not contact discovery. Users need
@@ -1770,8 +1965,14 @@ def action_contacts_lookup(params, conn, contacts, privacy_policy):
             label = contact_handle_label(handle) or (
                 "email" if "@" in handle else "phone"
             )
-            matches.append(_contact_refs.lookup_match(handle, full_name, label))
-    return {"query": name, "match_count": len(matches), "matches": matches[:25]}
+            match = _contact_refs.lookup_match(handle, full_name, label)
+            if gate_mode:
+                match["scopes"] = grant_scopes_for(handle, policy)
+            matches.append(match)
+    result = {"query": name, "match_count": len(matches), "matches": matches[:25]}
+    if gate_mode and policy.gate_error:
+        result["gate_error"] = policy.gate_error
+    return result
 
 
 action_contacts_lookup.needs_db = False  # type: ignore[attr-defined]
@@ -1904,6 +2105,19 @@ def action_list_chats(params, conn, contacts, privacy_policy):
     }
 
 
+def _gate_status(policy: PrivacyPolicy) -> dict[str, Any]:
+    ctx = gate_context()
+    if not ctx.enabled:
+        return {"configured": False}
+    return {
+        "configured": True,
+        "host": ctx.client.config.host if ctx.client is not None else None,
+        "reachable": policy.source == "gate" and policy.gate_error is None,
+        "error": policy.gate_error,
+        "grant_counts": {scope: len(getattr(policy, scope)) for scope in GRANT_SCOPES},
+    }
+
+
 def action_status(params, conn, contacts, privacy_policy):
     """Return compatibility and local-install status without reading messages."""
     policy = _coerce_policy(privacy_policy)
@@ -1924,10 +2138,12 @@ def action_status(params, conn, contacts, privacy_policy):
         "python_version": sys.version.split()[0],
         "read_policy": {
             "mode": policy.mode,
+            "source": policy.source,
             "allowlist_entries": len(policy.allowlist),
             "blocklist_entries": len(policy.blocklist),
             "root_owned_required": os.environ.get("COWORK_IMESSAGE_REQUIRE_ROOT_POLICY") == "1",
         },
+        "gate": _gate_status(policy),
         "checks": {
             "chat_db_exists": CHAT_DB_PATH.is_file(),
             "chat_db_readable": os.access(CHAT_DB_PATH, os.R_OK),
@@ -1957,6 +2173,35 @@ def _resolve_contact_name(to: str, contacts: dict[str, str]) -> str:
     return contacts.get(key, "") if key else ""
 
 
+def _deliver_message(to: str, text: str, service: str) -> None:
+    """Send via Messages.app. Callers must have validated all three values.
+
+    The `service type` slot is an AppleScript enum, not a string, so the
+    clause is picked statically from the validated service name.
+    """
+    if service == "iMessage":
+        svc_clause = "1st service whose service type = iMessage"
+    else:  # SMS — already validated against _SERVICE_ENUM
+        svc_clause = "1st service whose service type = SMS"
+
+    # Pass the body directly in the AppleScript with proper escaping.
+    # This eliminates the tempfile race where a malicious same-UID process
+    # could replace the file between write and read.
+    script = (
+        f'set msgBody to "{_escape_as_string(text)}"\n'
+        f'tell application "Messages"\n'
+        f'    set svc to {svc_clause}\n'
+        f'    send msgBody to buddy "{_escape_as_string(to)}" of svc\n'
+        f'end tell\n'
+    )
+    rc, stdout, stderr = _run_osascript(script)
+    if rc != 0:
+        raise RuntimeError(
+            f"osascript send failed (rc={rc}): "
+            f"{stderr or stdout or 'no output'}"
+        )
+
+
 def action_send_preview(params, conn, contacts, privacy_policy):
     """Non-destructive: resolve the recipient and return what *would* be sent.
 
@@ -1971,6 +2216,8 @@ def action_send_preview(params, conn, contacts, privacy_policy):
     """
     if not is_send_policy_enabled():
         raise ValueError("send operations are disabled by policy")
+    if _coerce_policy(privacy_policy).source == "gate":
+        return _gate_send_preview(params, contacts, privacy_policy)
 
     to = resolve_send_recipient(params, contacts)
     text = validate_send_text(params.get("text"))
@@ -2022,6 +2269,8 @@ def action_send(params, conn, contacts, privacy_policy):
     """
     if not is_send_policy_enabled():
         raise ValueError("send operations are disabled by policy")
+    if _coerce_policy(privacy_policy).source == "gate":
+        return _gate_send(params, contacts, privacy_policy)
 
     to = resolve_send_recipient(params, contacts)
     text = validate_send_text(params.get("text"))
@@ -2054,27 +2303,7 @@ def action_send(params, conn, contacts, privacy_policy):
             "send cancelled by user or timed out (60s dialog limit)"
         )
 
-    if service == "iMessage":
-        svc_clause = "1st service whose service type = iMessage"
-    else:  # SMS — already validated against _SERVICE_ENUM
-        svc_clause = "1st service whose service type = SMS"
-
-    # Pass the body directly in the AppleScript with proper escaping.
-    # This eliminates the tempfile race where a malicious same-UID process
-    # could replace the file between write and read.
-    script = (
-        f'set msgBody to "{_escape_as_string(text)}"\n'
-        f'tell application "Messages"\n'
-        f'    set svc to {svc_clause}\n'
-        f'    send msgBody to buddy "{_escape_as_string(to)}" of svc\n'
-        f'end tell\n'
-    )
-    rc, stdout, stderr = _run_osascript(script)
-    if rc != 0:
-        raise RuntimeError(
-            f"osascript send failed (rc={rc}): "
-            f"{stderr or stdout or 'no output'}"
-        )
+    _deliver_message(to, text, service)
 
     recipient_view = _agent_recipient_view(to, contacts)
     resolved_name = _resolve_contact_name(to, contacts)
@@ -2094,6 +2323,596 @@ def action_send(params, conn, contacts, privacy_policy):
 action_send.needs_db = False  # type: ignore[attr-defined]
 
 
+# ---------------------------------------------------------------------------
+# Approval gate actions (gate mode only)
+#
+# In gate mode the root-owned gate.json names an approval service. Grants
+# (send / read / watch) come from the gate; anything not granted becomes an
+# approval the owner decides on their phone. The helper can request and
+# revoke, never approve. Gate failures fail closed.
+# ---------------------------------------------------------------------------
+_E164_RE = re.compile(r"^\+[1-9]\d{6,14}$")
+_DURATION_RE = re.compile(r"^(\d+)\s*([mhdw])$")
+_DURATION_UNITS = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
+MAX_GRANT_DURATION_S = 366 * 86400
+UNKNOWN_CONTACT_NAME = "Unknown contact"
+MAX_INBOX_LIMIT = 200
+INBOX_SCAN_LIMIT = 2000
+INBOX_FIRST_RUN_HOURS = 24
+WATCH_TICK_SCAN_LIMIT = 10000
+_MAX_CURSOR = 2**63 - 1
+_WATCH_STATE_MAX_BYTES = 4096
+
+
+def gate_handle(raw: str) -> str:
+    """Express a sendable handle the way the gate stores it: E.164 or lowercased email."""
+    s = (raw or "").strip()
+    if "@" in s:
+        return s.lower()
+    digits = re.sub(r"\D", "", s)
+    if s.startswith("+"):
+        candidate = "+" + digits
+    elif len(digits) == 10:
+        candidate = "+1" + digits
+    elif len(digits) == 11 and digits.startswith("1"):
+        candidate = "+" + digits
+    else:
+        raise ValueError("recipient phone number needs a country code")
+    if not _E164_RE.match(candidate):
+        raise ValueError("recipient is not a valid E.164 phone number")
+    return candidate
+
+
+def parse_grant_duration(value: Any) -> int | None:
+    """'always' -> None (permanent); '30m', '1d', '1w', or seconds -> seconds."""
+    if value is None:
+        raise ValueError("duration required: e.g. '1d', '1w', or 'always'")
+    if isinstance(value, str) and value.strip().lower() == "always":
+        return None
+    if isinstance(value, bool):
+        raise ValueError("duration must be a string like '1d' or a number of seconds")
+    if isinstance(value, int):
+        seconds = value
+    elif isinstance(value, str):
+        m = _DURATION_RE.match(value.strip().lower())
+        if not m:
+            raise ValueError("duration must look like '30m', '12h', '1d', '1w', or 'always'")
+        seconds = int(m.group(1)) * _DURATION_UNITS[m.group(2)]
+    else:
+        raise ValueError("duration must be a string like '1d' or a number of seconds")
+    if seconds < 60:
+        raise ValueError("duration must be at least 1 minute")
+    if seconds > MAX_GRANT_DURATION_S:
+        raise ValueError("duration is longer than a year; use 'always' instead")
+    return seconds
+
+
+def validate_scopes(v: Any) -> list[str]:
+    items = [v] if isinstance(v, str) else v
+    if not isinstance(items, list) or not items:
+        raise ValueError(f"scopes must be a non-empty list drawn from {GRANT_SCOPES}")
+    if any(s not in GRANT_SCOPES for s in items):
+        raise ValueError(f"scopes must be drawn from {GRANT_SCOPES}")
+    return sorted(set(items))
+
+
+def _validate_cursor(v: Any, name: str = "cursor") -> int:
+    if isinstance(v, bool) or not isinstance(v, int) or v < 0 or v > _MAX_CURSOR:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return v
+
+
+def _require_gate(privacy_policy) -> tuple[GateContext, PrivacyPolicy]:
+    policy = _coerce_policy(privacy_policy)
+    ctx = gate_context()
+    if policy.source != "gate" or not ctx.enabled:
+        raise ValueError("the approval gate is not configured on this install")
+    if policy.gate_error or ctx.client is None:
+        raise RuntimeError(
+            f"approval gate unavailable, refusing: {policy.gate_error or ctx.error}"
+        )
+    return ctx, policy
+
+
+def _gate_call(ctx: GateContext, fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except ctx.module.GateUnavailable as exc:
+        raise RuntimeError(f"approval gate unavailable: {exc}") from None
+
+
+def _gate_request_error(exc) -> Exception:
+    if exc.status == 429:
+        retry = next(
+            (v for k, v in exc.headers.items() if k.lower() == "retry-after"), None
+        )
+        suffix = f"; retry in {retry}s" if retry else ""
+        return RuntimeError(f"approval request rate limit reached{suffix}")
+    if exc.status == 422:
+        return ValueError(f"gate rejected the request: {exc.detail}")
+    return RuntimeError(f"gate returned {exc.status}: {exc.detail}")
+
+
+def _gate_audit(ctx: GateContext, event: str, **kwargs) -> None:
+    """Best effort: the message is already out, so an audit failure is only logged."""
+    try:
+        ctx.client.audit(event, **kwargs)
+    except ctx.errors as exc:
+        log(f"gate: audit {event} failed: {exc}")
+
+
+def _prepare_gate_send(params, contacts, policy: PrivacyPolicy):
+    to = resolve_send_recipient(params, contacts)
+    text = validate_send_text(params.get("text"))
+    service = validate_service(params.get("service"))
+    if is_blocked(to, to, policy):
+        raise ValueError("refusing to send: recipient is in contacts/blocked_chats.txt")
+    handle = gate_handle(to)
+    name = _resolve_contact_name(to, contacts)
+    return handle, text, service, name, _agent_recipient_view(handle, contacts)
+
+
+def _gate_send_preview(params, contacts, privacy_policy):
+    _ctx, policy = _require_gate(privacy_policy)
+    handle, text, service, _name, view = _prepare_gate_send(params, contacts, policy)
+    granted = _matches_list(handle, handle, policy.send)
+    return {
+        "preview": {
+            **view,
+            "service": service,
+            "text": text,
+            "text_length": len(text),
+            "blocked": False,
+        },
+        "authorization": "send_grant" if granted else "approval_required",
+    }
+
+
+def _gate_send(params, contacts, privacy_policy):
+    ctx, policy = _require_gate(privacy_policy)
+    handle, text, service, name, view = _prepare_gate_send(params, contacts, policy)
+
+    if _matches_list(handle, handle, policy.send):
+        _deliver_message(handle, text, service)
+        _gate_audit(
+            ctx,
+            "send",
+            handle=handle,
+            detail={"via": "send_grant", "service": service, "text_length": len(text)},
+        )
+        return {
+            "status": "sent",
+            "sent": {
+                **view,
+                "via": "send_grant",
+                "service": service,
+                "text_length": len(text),
+                "sent_at": datetime.now().isoformat(timespec="seconds"),
+            },
+        }
+
+    payload = {
+        "handle": handle,
+        "display_name": (name or UNKNOWN_CONTACT_NAME)[:200],
+        "service": service,
+        "text": text,
+    }
+    try:
+        approval = _gate_call(ctx, ctx.client.create_approval, "send", payload)
+    except ctx.module.GateError as exc:
+        raise _gate_request_error(exc) from None
+    return {
+        "status": "pending_approval",
+        "approval_id": approval["id"],
+        "approve_url": approval.get("approve_url"),
+        "expires_at": approval.get("expires_at"),
+        "recipient": view,
+        "service": service,
+        "text_length": len(text),
+    }
+
+
+def action_send_commit(params, conn, contacts, privacy_policy):
+    """Send the gate-stored payload of an approved send, exactly once.
+
+    The request carries only approval_id. Recipient, service, and text all
+    come from the gate, so nothing the caller sends can change what goes out.
+    """
+    if not is_send_policy_enabled():
+        raise ValueError("send operations are disabled by policy")
+    ctx, policy = _require_gate(privacy_policy)
+    approval_id = ctx.module.validate_approval_id(params.get("approval_id"))
+    try:
+        consumed = _gate_call(ctx, ctx.client.consume, approval_id)
+    except ctx.module.GateError as exc:
+        if exc.status == 404:
+            raise ValueError("unknown approval_id") from None
+        status = exc.detail_status
+        if exc.status == 409 and status == "pending":
+            return {"status": "pending_approval", "approval_id": approval_id}
+        if exc.status == 409 and status:
+            raise ValueError(f"approval is {status}; nothing was sent") from None
+        raise _gate_request_error(exc) from None
+
+    payload = consumed["payload"]
+    handle = validate_send_recipient(payload.get("handle"))
+    if gate_handle(handle) != handle:
+        raise RuntimeError("gate returned a malformed recipient; nothing was sent")
+    text = validate_send_text(payload.get("text"))
+    service = validate_service(payload.get("service"))
+    if is_blocked(handle, handle, policy):
+        raise ValueError(
+            "refusing to send: recipient is in contacts/blocked_chats.txt "
+            "(the approval was consumed)"
+        )
+    _deliver_message(handle, text, service)
+    _gate_audit(
+        ctx,
+        "send",
+        handle=handle,
+        approval_id=approval_id,
+        detail={"via": "approval", "service": service, "text_length": len(text)},
+    )
+    return {
+        "status": "sent",
+        "sent": {
+            **_agent_recipient_view(handle, contacts),
+            "via": "approval",
+            "approval_id": approval_id,
+            "service": service,
+            "text_length": len(text),
+            "sent_at": datetime.now().isoformat(timespec="seconds"),
+        },
+    }
+
+
+action_send_commit.needs_db = False  # type: ignore[attr-defined]
+
+
+def action_request_grant(params, conn, contacts, privacy_policy):
+    ctx, policy = _require_gate(privacy_policy)
+    to = resolve_send_recipient(params, contacts)
+    if is_blocked(to, to, policy):
+        raise ValueError("refusing: contact is in contacts/blocked_chats.txt")
+    scopes = validate_scopes(params.get("scopes"))
+    duration = parse_grant_duration(params.get("duration"))
+    handle = gate_handle(to)
+    payload = {
+        "handle": handle,
+        "display_name": (_resolve_contact_name(to, contacts) or UNKNOWN_CONTACT_NAME)[:200],
+        "scopes": scopes,
+        "duration_seconds": duration,
+    }
+    try:
+        approval = _gate_call(ctx, ctx.client.create_approval, "grant", payload)
+    except ctx.module.GateError as exc:
+        raise _gate_request_error(exc) from None
+    return {
+        "status": "pending_approval",
+        "approval_id": approval["id"],
+        "approve_url": approval.get("approve_url"),
+        "expires_at": approval.get("expires_at"),
+        "recipient": _agent_recipient_view(handle, contacts),
+        "scopes": scopes,
+        "duration_seconds": duration,
+    }
+
+
+action_request_grant.needs_db = False  # type: ignore[attr-defined]
+
+
+def action_approval_status(params, conn, contacts, privacy_policy):
+    ctx, _policy = _require_gate(privacy_policy)
+    approval_id = ctx.module.validate_approval_id(params.get("approval_id"))
+    try:
+        data = _gate_call(ctx, ctx.client.get_approval, approval_id)
+    except ctx.module.GateError as exc:
+        if exc.status == 404:
+            raise ValueError("unknown approval_id") from None
+        raise _gate_request_error(exc) from None
+    out = {
+        "approval_id": data.get("id"),
+        "kind": data.get("kind"),
+        "status": data.get("status"),
+        "expires_at": data.get("expires_at"),
+        "decided_at": data.get("decided_at"),
+    }
+    if isinstance(data.get("grants"), list):
+        out["grants"] = [
+            {"grant_id": g.get("id"), "scope": g.get("scope"), "expires_at": g.get("expires_at")}
+            for g in data["grants"]
+            if isinstance(g, dict)
+        ]
+    return out
+
+
+action_approval_status.needs_db = False  # type: ignore[attr-defined]
+action_approval_status.needs_contacts = False  # type: ignore[attr-defined]
+
+
+def _grant_view(grant: dict[str, Any], contacts: dict[str, str]) -> dict[str, Any] | None:
+    key = _normalize_handle(grant["handle"])
+    if not key:
+        return None
+    return {
+        "grant_id": grant["id"],
+        "scope": grant["scope"],
+        "expires_at": grant["expires_at"],
+        "name": contacts.get(key) or grant["display_name"],
+        "label": contact_handle_label(key) or ("email" if "@" in key else "phone"),
+        "service": _contact_refs.contact_service(key),
+        "contact_ref": _contact_refs.make_contact_ref(key),
+    }
+
+
+def action_list_grants(params, conn, contacts, privacy_policy):
+    _ctx, policy = _require_gate(privacy_policy)
+    views = [v for v in (_grant_view(g, contacts) for g in policy.grants) if v]
+    return {"count": len(views), "grants": views}
+
+
+action_list_grants.needs_db = False  # type: ignore[attr-defined]
+
+
+def action_revoke_grant(params, conn, contacts, privacy_policy):
+    """Revoke by grant_id, or every active grant for a contact_ref (optionally one scope)."""
+    ctx, policy = _require_gate(privacy_policy)
+    grant_id = params.get("grant_id")
+    ref = params.get("contact_ref")
+    scope = params.get("scope")
+    if (grant_id is None) == (ref is None):
+        raise ValueError("provide grant_id or contact_ref")
+    if scope is not None and scope not in GRANT_SCOPES:
+        raise ValueError(f"scope must be one of {GRANT_SCOPES}")
+
+    if grant_id is not None:
+        if isinstance(grant_id, bool) or not isinstance(grant_id, int) or grant_id <= 0:
+            raise ValueError("grant_id must be a positive integer")
+        ids = [grant_id]
+    else:
+        if not isinstance(ref, str) or not ref.strip():
+            raise ValueError("contact_ref must be a non-empty string")
+        key = _contact_refs._hmac_key()
+        ids = [
+            g["id"]
+            for g in policy.grants
+            if (scope is None or g["scope"] == scope)
+            and _normalize_handle(g["handle"])
+            and hmac.compare_digest(
+                _contact_refs.make_contact_ref(_normalize_handle(g["handle"]), key),
+                ref.strip(),
+            )
+        ]
+        if not ids:
+            raise ValueError("no active grants match that contact_ref")
+
+    revoked = []
+    for gid in ids:
+        try:
+            result = _gate_call(ctx, ctx.client.revoke_grant, gid)
+        except ctx.module.GateError as exc:
+            if exc.status == 404:
+                raise ValueError(f"unknown grant_id {gid}") from None
+            raise _gate_request_error(exc) from None
+        grant = result.get("grant") if isinstance(result, dict) else None
+        revoked.append(
+            {
+                "grant_id": gid,
+                "scope": grant.get("scope") if isinstance(grant, dict) else None,
+                "newly_revoked": bool(result.get("revoked")) if isinstance(result, dict) else False,
+            }
+        )
+    return {"revoked": revoked}
+
+
+action_revoke_grant.needs_db = False  # type: ignore[attr-defined]
+action_revoke_grant.needs_contacts = False  # type: ignore[attr-defined]
+
+
+def _load_watch_state() -> dict[str, Any]:
+    try:
+        with _private_directory_fd(WATCH_STATE_PATH.parent, create=True) as state_fd:
+            try:
+                fd = os.open(
+                    WATCH_STATE_PATH.name, os.O_RDONLY | _FILE_NOFOLLOW_FLAGS, dir_fd=state_fd
+                )
+            except FileNotFoundError:
+                return {}
+            try:
+                metadata = _validate_regular_file(fd, str(WATCH_STATE_PATH), private=True)
+                if metadata.st_size > _WATCH_STATE_MAX_BYTES:
+                    raise ValueError("watch state too large")
+                data = json.loads(os.read(fd, _WATCH_STATE_MAX_BYTES + 1).decode("utf-8"))
+            finally:
+                os.close(fd)
+    except (OSError, ValueError, UnsafeRuntimePath) as exc:
+        log(f"watch state unreadable, resetting: {exc}")
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_watch_state(state: dict[str, Any]) -> None:
+    name = WATCH_STATE_PATH.name
+    tmp = f".{name}.{uuid.uuid4().hex}.tmp"
+    with _private_directory_fd(WATCH_STATE_PATH.parent, create=True) as state_fd:
+        fd = os.open(
+            tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _FILE_NOFOLLOW_FLAGS, 0o600, dir_fd=state_fd
+        )
+        try:
+            _validate_regular_file(fd, tmp, private=True)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                fd = -1
+                json.dump(state, f)
+            os.replace(tmp, name, src_dir_fd=state_fd, dst_dir_fd=state_fd)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                os.unlink(tmp, dir_fd=state_fd)
+            except FileNotFoundError:
+                pass
+
+
+def _state_cursor(state: dict[str, Any], key: str) -> int | None:
+    value = state.get(key)
+    try:
+        return _validate_cursor(value, key)
+    except ValueError:
+        return None
+
+
+def _max_message_rowid(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT COALESCE(MAX(ROWID), 0) FROM message").fetchone()
+    return int(row[0] or 0)
+
+
+def open_chatdb_direct() -> sqlite3.Connection:
+    """Read-only connection to the live chat.db for small, cursor-bounded
+    queries (inbox, watch_tick) where a full snapshot every minute would be
+    wasteful. Nothing is written to disk."""
+    if not CHAT_DB_PATH.exists():
+        raise RuntimeError(f"chat.db not found at {CHAT_DB_PATH}")
+    uri = f"{CHAT_DB_PATH.resolve().as_uri()}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=5)
+    conn.text_factory = bytes
+    return conn
+
+
+_WATCH_TICK_SQL = """
+    SELECT m.ROWID, c.chat_identifier, COALESCE(h.id, '')
+    FROM message m
+    JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+    JOIN chat c ON c.ROWID = cmj.chat_id
+    LEFT JOIN handle h ON h.ROWID = m.handle_id
+    WHERE m.ROWID > ? AND m.ROWID <= ? AND m.is_from_me = 0
+    ORDER BY m.ROWID ASC
+    LIMIT ?
+"""
+
+
+def action_watch_tick(params, conn, contacts, privacy_policy):
+    """Content-free: how many new inbound messages from watched contacts
+    arrived since the last tick. The cursor lives in bridge state."""
+    _ctx, policy = _require_gate(privacy_policy)
+    watch_policy = scoped_policy(policy, "watch")
+    state = _load_watch_state()
+    cursor = _state_cursor(state, "tick_cursor")
+    max_rowid = _max_message_rowid(conn)
+    if cursor is None or cursor > max_rowid:
+        state["tick_cursor"] = max_rowid
+        _save_watch_state(state)
+        return {"new_count": 0, "initialized": True, "capped": False}
+
+    rows = conn.execute(_WATCH_TICK_SQL, (cursor, max_rowid, WATCH_TICK_SCAN_LIMIT)).fetchall()
+    count = 0
+    seen: set[int] = set()
+    for rowid, chat_id, sender in rows:
+        if rowid in seen:
+            continue
+        if is_read_allowed(_decode_db_text(chat_id), _decode_db_text(sender), watch_policy):
+            seen.add(rowid)
+            count += 1
+    capped = len(rows) == WATCH_TICK_SCAN_LIMIT
+    state["tick_cursor"] = int(rows[-1][0]) if capped else max_rowid
+    _save_watch_state(state)
+    return {"new_count": count, "initialized": False, "capped": capped}
+
+
+action_watch_tick.db_mode = "direct"  # type: ignore[attr-defined]
+action_watch_tick.needs_contacts = False  # type: ignore[attr-defined]
+
+
+_INBOX_SQL = """
+    SELECT m.ROWID, c.chat_identifier, c.style, m.date, COALESCE(h.id, ''),
+           m.text, m.attributedBody
+    FROM message m
+    JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+    JOIN chat c ON c.ROWID = cmj.chat_id
+    LEFT JOIN handle h ON h.ROWID = m.handle_id
+    WHERE m.ROWID > ? AND m.ROWID <= ? AND m.is_from_me = 0 AND m.date > ?
+    ORDER BY m.ROWID ASC
+    LIMIT ?
+"""
+
+
+def action_inbox(params, conn, contacts, privacy_policy):
+    """New inbound messages from watch-scoped contacts, newest cursor last.
+
+    Without `cursor` the helper resumes from its own saved inbox cursor (first
+    run: the last 24 hours) and advances it. Senders appear as name, label,
+    and contact_ref, never as raw handles.
+    """
+    _ctx, policy = _require_gate(privacy_policy)
+    watch_policy = scoped_policy(policy, "watch")
+    limit = int(_as_number(params.get("limit", 50), "limit"))
+    if limit <= 0 or limit > MAX_INBOX_LIMIT:
+        raise ValueError(f"limit must be in (0, {MAX_INBOX_LIMIT}]")
+
+    explicit = params.get("cursor")
+    state = _load_watch_state() if explicit is None else {}
+    since_ns = 0
+    if explicit is not None:
+        cursor = _validate_cursor(explicit)
+    else:
+        saved = _state_cursor(state, "inbox_cursor")
+        if saved is None:
+            cursor = 0
+            since_ns = to_apple_ns(time.time() - INBOX_FIRST_RUN_HOURS * 3600)
+        else:
+            cursor = saved
+
+    max_rowid = _max_message_rowid(conn)
+    rows = conn.execute(_INBOX_SQL, (cursor, max_rowid, since_ns, INBOX_SCAN_LIMIT)).fetchall()
+    messages: list[dict[str, Any]] = []
+    next_cursor = cursor
+    filled = False
+    seen: set[int] = set()
+    for rowid, chat_id, style, date_ns, sender, text, attrib in rows:
+        next_cursor = int(rowid)
+        chat_id = _decode_db_text(chat_id)
+        sender = _decode_db_text(sender)
+        if rowid in seen or not is_read_allowed(chat_id, sender, watch_policy):
+            continue
+        seen.add(rowid)
+        body = _decode_db_text(text)
+        if not body and attrib:
+            body = decode_attributed_body(attrib)
+        key = _normalize_handle(sender or chat_id)
+        messages.append(
+            {
+                "message_id": int(rowid),
+                "ts": from_apple_ns(date_ns).isoformat(timespec="seconds"),
+                "name": contacts.get(key, "") if key else "",
+                "label": (contact_handle_label(key) or ("email" if "@" in key else "phone"))
+                if key
+                else "",
+                "contact_ref": _contact_refs.make_contact_ref(key) if key else None,
+                "is_group": _chat_kind(chat_id, style) == "group",
+                "text": redact(body)[:MAX_TEXT_SNIPPET],
+            }
+        )
+        if len(messages) >= limit:
+            filled = True
+            break
+
+    has_more = filled or len(rows) == INBOX_SCAN_LIMIT
+    if not has_more:
+        next_cursor = max(next_cursor, max_rowid)
+    if explicit is None:
+        state["inbox_cursor"] = next_cursor
+        _save_watch_state(state)
+    return {
+        "cursor": cursor,
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+        "count": len(messages),
+        "messages": messages,
+    }
+
+
+action_inbox.db_mode = "direct"  # type: ignore[attr-defined]
+
+
 ACTIONS = {
     "status": action_status,
     "review": action_review,
@@ -2104,6 +2923,13 @@ ACTIONS = {
     "list_chats": action_list_chats,
     "send_preview": action_send_preview,
     "send": action_send,
+    "send_commit": action_send_commit,
+    "request_grant": action_request_grant,
+    "approval_status": action_approval_status,
+    "list_grants": action_list_grants,
+    "revoke_grant": action_revoke_grant,
+    "inbox": action_inbox,
+    "watch_tick": action_watch_tick,
 }
 
 
@@ -2282,7 +3108,10 @@ def process_request(
         # hundreds-of-MB) chat.db snapshot on that path.
         needs_db = getattr(action_fn, "needs_db", True)
         if needs_db:
-            conn = copy_chatdb()
+            if getattr(action_fn, "db_mode", "snapshot") == "direct":
+                conn = open_chatdb_direct()
+            else:
+                conn = copy_chatdb()
         needs_contacts = getattr(action_fn, "needs_contacts", True)
         contacts = load_contacts() if needs_contacts else {}
         result = action_fn(params, conn, contacts, privacy_policy)

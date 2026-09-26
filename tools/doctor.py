@@ -107,6 +107,8 @@ def inspect_install(args: argparse.Namespace) -> dict[str, Any]:
         "log": (bridge / "control" / "log.txt", 0o600),
         "read_policy": (bridge / "contacts" / "read_policy.txt", 0o600),
     }
+    if hardened:
+        protected_files["gate_client_source"] = (code_root / "bin" / "gate_client.py", 0o444)
     for name, (path, expected) in protected_files.items():
         expected_uid = expected_code_uid if name.endswith("source") else os.getuid()
         ok = (

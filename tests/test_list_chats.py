@@ -413,7 +413,7 @@ class RoleGateTests(_FixtureMixin, unittest.TestCase):
         os.environ[_ROLE_ENV] = "manager"
         resp = self._run("status")
         self.assertTrue(resp["ok"])
-        self.assertEqual(resp["protocol_version"], "1.2")
+        self.assertEqual(resp["protocol_version"], "1.3")
         self.assertEqual(resp["bridge_role"], "manager")
         self.assertEqual(resp["allowed_actions"], sorted(helper._MANAGER_ACTIONS))
 
