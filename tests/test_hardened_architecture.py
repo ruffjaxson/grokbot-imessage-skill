@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 from tests._helper_loader import REPO_ROOT, helper
+from tests.test_contact_refs import TEST_KEY, _match
 
 
 ALLOWLIST_TOOL_PATH = REPO_ROOT / "tools" / "configure_allowlist.py"
@@ -136,8 +137,8 @@ print(module.ALLOWLIST_PATH)
         self.assertEqual(
             result["matches"],
             [
-                {"name": "Alice Example", "email": "alice@example.com"},
-                {"name": "Bob Example", "email": "bob@example.com"},
+                _match("Alice Example", "alice@example.com"),
+                _match("Bob Example", "bob@example.com"),
             ],
         )
 
@@ -164,7 +165,7 @@ print(module.ALLOWLIST_PATH)
             policy,
         )
         self.assertEqual(
-            result["matches"], [{"name": "Alice Example", "email": "alice@example.com"}]
+            result["matches"], [_match("Alice Example", "alice@example.com")]
         )
 
     def test_email_entries_match_exactly(self) -> None:

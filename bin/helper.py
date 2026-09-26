@@ -92,6 +92,14 @@ SEND_GATE_PATH = Path(
         )
     )
 )
+CONTACT_REFS_PATH = Path(
+    os.path.abspath(
+        os.path.expanduser(
+            os.environ.get("IMESSAGE_CONTACT_REFS_PATH")
+            or str(CODE_ROOT / "bin" / "contact_refs.py")
+        )
+    )
+)
 CONFIRM_HELPER_PATH = Path(
     os.path.abspath(
         os.path.expanduser(
@@ -169,6 +177,32 @@ def _load_sibling(name: str):
     return mod
 
 
+def _load_contact_refs():
+    try:
+        metadata = CONTACT_REFS_PATH.lstat()
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError(
+                f"contact_refs must be a regular file: {CONTACT_REFS_PATH}"
+            )
+        if metadata.st_uid != 0 and metadata.st_uid != os.getuid():
+            raise RuntimeError(
+                f"contact_refs must be owned by root or current user: {CONTACT_REFS_PATH}"
+            )
+        if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise RuntimeError(
+                f"contact_refs must not be group/world-writable: {CONTACT_REFS_PATH}"
+            )
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"contact_refs not found: {CONTACT_REFS_PATH}") from exc
+
+    spec = _importlib_util.spec_from_file_location("contact_refs", CONTACT_REFS_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"failed to load contact_refs from {CONTACT_REFS_PATH}")
+    mod = _importlib_util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def _load_send_gate():
     # Item 3: defense-in-depth file validation
     # Wrapper validate_file is the trust boundary; this check adds depth.
@@ -197,6 +231,7 @@ def _load_send_gate():
 # compatibility input. Empty explicit values have already failed closed above.
 if "IMESSAGE_BRIDGE_DIR" not in os.environ and "COWORK_IMESSAGE_BRIDGE_DIR" not in os.environ:
     os.environ["IMESSAGE_BRIDGE_DIR"] = str(BRIDGE_ROOT)
+_contact_refs = _load_contact_refs()
 _send_gate = _load_send_gate()
 SEND_NONCE_TTL = _send_gate.SEND_NONCE_TTL
 SendGateError = _send_gate.SendGateError
@@ -547,6 +582,14 @@ def _normalize_handle(h: str) -> str:
     return digits[-10:] if len(digits) >= 10 else ""
 
 
+_CONTACT_RAW_HANDLES: dict[str, str] = {}
+
+
+def contact_raw_handle(normalized: str) -> str:
+    """Return the sendable handle for a normalized contacts key."""
+    return _CONTACT_RAW_HANDLES.get(normalized, normalized)
+
+
 def load_contacts() -> dict[str, str]:
     """Return {normalized_handle: display_name}.
 
@@ -554,7 +597,9 @@ def load_contacts() -> dict[str, str]:
     CardDAV/iCloud sources). Loads phones, emails, and organizations. Logs
     how many handles were loaded so debugging doesn't require guessing.
     """
+    global _CONTACT_RAW_HANDLES
     handle_to_name: dict[str, str] = {}
+    raw_handles: dict[str, str] = {}
     db_files: list[str] = []
     for pattern in _ADDRESSBOOK_PATTERNS:
         db_files.extend(glob.glob(os.path.expanduser(pattern)))
@@ -603,8 +648,10 @@ def load_contacts() -> dict[str, str]:
                         continue
                     digits = re.sub(r"[^0-9]", "", num)
                     if len(digits) >= 10:
-                        if handle_to_name.setdefault(digits[-10:], records[owner]) \
+                        key = digits[-10:]
+                        if handle_to_name.setdefault(key, records[owner]) \
                                 is records[owner]:
+                            raw_handles.setdefault(key, num.strip())
                             total_phones += 1
             except sqlite3.Error as e:
                 log(f"contacts: phones table error on {p}: {e}")
@@ -630,12 +677,14 @@ def load_contacts() -> dict[str, str]:
                 if addr and "@" in addr:
                     if handle_to_name.setdefault(addr, records[owner]) \
                             is records[owner]:
+                        raw_handles.setdefault(addr, addr)
                         total_emails += 1
 
             conn.close()
         except Exception as e:
             log(f"contacts: warn on {p}: {e}")
 
+    _CONTACT_RAW_HANDLES = raw_handles
     log(f"contacts: loaded {len(handle_to_name)} handles "
         f"({total_phones} phones, {total_emails} emails) "
         f"from {len(db_files)} source(s)")
@@ -1106,6 +1155,33 @@ def validate_chat(v: Any) -> str:
     if len(v) > 200:
         raise ValueError("chat identifier too long")
     return v.strip()
+
+
+def _agent_recipient_view(
+    to: str, contacts: dict[str, str]
+) -> dict[str, str]:
+    """Agent-safe recipient fields (no raw phone/email)."""
+    normalized = _normalize_handle(to)
+    if not normalized:
+        raise ValueError("unable to derive contact_ref for recipient")
+    return _contact_refs.lookup_match(
+        normalized,
+        _resolve_contact_name(to, contacts),
+    )
+
+
+def resolve_send_recipient(params: dict[str, Any], contacts: dict[str, str]) -> str:
+    """Resolve send target from contact_ref or raw to."""
+    ref = params.get("contact_ref")
+    to = params.get("to")
+    if ref is not None and to is not None:
+        raise ValueError("provide contact_ref or to, not both")
+    if ref is not None:
+        normalized = _contact_refs.resolve_contact_ref(ref, contacts)
+        return contact_raw_handle(normalized)
+    if to is not None:
+        return validate_send_recipient(to)
+    raise ValueError("contact_ref or to required")
 
 
 def validate_send_recipient(v: Any) -> str:
@@ -1639,10 +1715,7 @@ def action_contacts_lookup(params, conn, contacts, privacy_policy):
         if bridge_role() != "manager" and is_blocked(handle, handle, privacy_policy):
             continue
         if nl in full_name.lower():
-            if "@" in handle:
-                matches.append({"name": full_name, "email": handle})
-            else:
-                matches.append({"name": full_name, "phone_last10": handle})
+            matches.append(_contact_refs.lookup_match(handle, full_name))
     return {"query": name, "match_count": len(matches), "matches": matches[:25]}
 
 
@@ -1844,7 +1917,7 @@ def action_send_preview(params, conn, contacts, privacy_policy):
     if not is_send_policy_enabled():
         raise ValueError("send operations are disabled by policy")
 
-    to = validate_send_recipient(params.get("to"))
+    to = resolve_send_recipient(params, contacts)
     text = validate_send_text(params.get("text"))
     service = validate_service(params.get("service"))
 
@@ -1855,9 +1928,12 @@ def action_send_preview(params, conn, contacts, privacy_policy):
         if is_read_allowed(to, to, privacy_policy)
         else ""
     )
+    recipient_view = _agent_recipient_view(to, contacts)
+    if resolved_name:
+        recipient_view = {**recipient_view, "name": resolved_name}
     return {
         "preview": {
-            "to": to,
+            **recipient_view,
             "resolved_name": resolved_name,
             "service": service,
             "text": text,
@@ -1892,7 +1968,7 @@ def action_send(params, conn, contacts, privacy_policy):
     if not is_send_policy_enabled():
         raise ValueError("send operations are disabled by policy")
 
-    to = validate_send_recipient(params.get("to"))
+    to = resolve_send_recipient(params, contacts)
     text = validate_send_text(params.get("text"))
     service = validate_service(params.get("service"))
 
@@ -1945,10 +2021,14 @@ def action_send(params, conn, contacts, privacy_policy):
             f"{stderr or stdout or 'no output'}"
         )
 
+    recipient_view = _agent_recipient_view(to, contacts)
+    resolved_name = _resolve_contact_name(to, contacts)
+    if resolved_name:
+        recipient_view = {**recipient_view, "name": resolved_name}
     return {
         "sent": {
-            "to": to,
-            "resolved_name": _resolve_contact_name(to, contacts),
+            **recipient_view,
+            "resolved_name": resolved_name,
             "service": service,
             "text_length": len(text),
             "sent_at": datetime.now().isoformat(timespec="seconds"),

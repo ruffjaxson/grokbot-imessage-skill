@@ -30,6 +30,8 @@ LEGACY_WRAPPER="$CODE_ROOT/bin/cowork-imessage-helper"
 LEGACY_MIGRATOR="$SOURCE_ROOT/tools/migrate_legacy_launchagent.py"
 PYTHON_SELECTOR="$SOURCE_ROOT/tools/select_python.sh"
 ALLOWLIST="$CONFIG_ROOT/allowed_chats.txt"
+GATE_JSON="$CONFIG_ROOT/gate.json"
+CONTACT_REFS_PY="$CODE_ROOT/bin/contact_refs.py"
 CURRENT_USER="$(id -un)"
 BUILD_DIR="$(mktemp -d -t grokbot-imessage-build.XXXXXX)"
 trap 'rm -rf "$BUILD_DIR"' EXIT
@@ -84,7 +86,9 @@ fi
 for path in \
     "$SOURCE_ROOT/bin/helper.py" \
     "$SOURCE_ROOT/bin/send_gate.py" \
+    "$SOURCE_ROOT/bin/contact_refs.py" \
     "$SOURCE_ROOT/bin/imessage_helper.c" \
+    "$SOURCE_ROOT/contacts/gate.json.template" \
     "$SOURCE_ROOT/bin/confirm_imessage_send.m" \
     "$SOURCE_ROOT/tools/doctor.py" \
     "$SOURCE_ROOT/tools/configure_allowlist.py" \
@@ -157,6 +161,34 @@ if ! sudo /bin/chmod -N "$ALLOWLIST" 2>/dev/null; then
 fi
 sudo /bin/chmod +a "user:$CURRENT_USER allow read" "$ALLOWLIST"
 
+if [[ -L "$GATE_JSON" ]]; then
+    echo "Error: hardened gate config must not be a symlink: $GATE_JSON" >&2
+    exit 1
+fi
+if [[ ! -e "$GATE_JSON" ]]; then
+    "$PYTHON3_PATH" -c 'import json, secrets; print(json.dumps({"schema_version": 1, "contact_ref_hmac_key": secrets.token_urlsafe(32)}))' \
+        | sudo /usr/bin/tee "$GATE_JSON" >/dev/null
+    sudo /usr/bin/chown root:wheel "$GATE_JSON"
+    sudo /bin/chmod 600 "$GATE_JSON"
+fi
+if ! "$PYTHON3_PATH" - "$GATE_JSON" <<'PYCHECK'; then
+import os
+import stat
+import sys
+
+metadata = os.lstat(sys.argv[1])
+valid = stat.S_ISREG(metadata.st_mode) and metadata.st_uid == 0
+valid = valid and not metadata.st_mode & (stat.S_IRWXG | stat.S_IRWXO)
+raise SystemExit(0 if valid else 1)
+PYCHECK
+    echo "Error: existing hardened gate.json is not a protected root-owned file." >&2
+    exit 1
+fi
+if ! sudo /bin/chmod -N "$GATE_JSON" 2>/dev/null; then
+    echo "  no existing ACL to clear on gate.json"
+fi
+sudo /bin/chmod +a "user:$CURRENT_USER allow read" "$GATE_JSON"
+
 clang -Wall -Wextra -Werror -fobjc-arc \
     -framework AppKit -framework Foundation \
     -o "$BUILD_DIR/grokbot-imessage-confirm" "$SOURCE_ROOT/bin/confirm_imessage_send.m"
@@ -170,6 +202,8 @@ clang -Wall -Wextra -Werror -O2 \
     -DEXPECTED_CODE_UID=0 \
     -DREAD_POLICY_MODE='"allowlist"' \
     -DREAD_ALLOWLIST_PATH="\"$ALLOWLIST\"" \
+    -DIMESSAGE_GATE_PATH="\"$GATE_JSON\"" \
+    -DCONTACT_REFS_SCRIPT="\"$CONTACT_REFS_PY\"" \
     -DREQUIRE_ROOT_POLICY=1 \
     -DHELPER_DISPLAY_NAME='"grokbot-imessage-helper"' \
     -DHOST_DISPLAY_NAME='"Grok Bot"' \
@@ -188,6 +222,8 @@ sudo /usr/bin/install -o root -g wheel -m 444 \
     "$SOURCE_ROOT/bin/helper.py" "$CODE_ROOT/bin/helper.py"
 sudo /usr/bin/install -o root -g wheel -m 444 \
     "$SOURCE_ROOT/bin/send_gate.py" "$CODE_ROOT/bin/send_gate.py"
+sudo /usr/bin/install -o root -g wheel -m 444 \
+    "$SOURCE_ROOT/bin/contact_refs.py" "$CODE_ROOT/bin/contact_refs.py"
 sudo /usr/bin/install -o root -g wheel -m 444 \
     "$SOURCE_ROOT/bin/imessage_helper.c" "$CODE_ROOT/bin/imessage_helper.c"
 sudo /usr/bin/install -o root -g wheel -m 444 \
