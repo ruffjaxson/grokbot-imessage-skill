@@ -127,6 +127,22 @@ python3 "$CODE_ROOT/tools/configure_allowlist.py" \
 The root-owned wrapper validates `helper.py`, `send_gate.py`, the confirmation
 binary, and the root-owned allowlist before inheriting Full Disk Access.
 
+**Optional: approval gate (hardened only).** Instead of the local allowlist and
+the Mac confirmation dialog, a hardened install can use an `imessage-gate`
+service. It holds per-contact `send` / `read` / `watch` grants and asks you
+to approve anything else on your phone with a passkey. Give the installer the
+gate origin; it prompts for the helper token without echoing it:
+
+```bash
+IMESSAGE_GATE_URL=https://imessage-gate.example.ts.net ./install-hardened.sh
+# non-interactive: IMESSAGE_GATE_TOKEN_FILE=/path/to/token (first line)
+```
+
+The URL and token are written to the root-owned `gate.json`. Rerunning the
+installer without `IMESSAGE_GATE_URL` keeps them. The helper fails closed when
+the gate is unreachable. See [Approval Gate Mode](docs/PROTOCOL.md#approval-gate-mode-13)
+and [SECURITY.md](SECURITY.md#approval-gate-mode-hardened-installs).
+
 Both installers:
 - Compile the C wrapper with your install path baked in
 - Compile a native, scrollable send-confirmation window

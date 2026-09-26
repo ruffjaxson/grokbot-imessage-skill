@@ -139,6 +139,37 @@ the maximum disclosure to explicitly allowlisted chats, but any same-user proces
 can request and consume data from those chats. Do not allowlist conversations
 whose disclosure to another local process would be unacceptable.
 
+## Approval gate mode (hardened installs)
+
+When the root-owned `gate.json` names an approval gate (`gate_url`,
+`helper_token`), the gate replaces the local allowlist and the Mac
+confirmation dialog:
+
+- **Grants** (`send`, `read`, `watch`, each per contact, permanent or
+  expiring) come from the gate. Anything not granted becomes an approval that
+  only a passkey on the owner's phone can approve. The local blocklist still
+  wins.
+- **The helper token cannot approve or grant.** `gate.json` is readable by your
+  user (like the contact-ref key), so any same-user process can read the token.
+  With it, such a process can read the grant list, create approval requests
+  (which reach your phone and are rate-limited), revoke grants, write audit
+  entries, and consume an approval you already granted. It cannot grant access
+  or approve a send, and editing `gate.json` requires root.
+- **Commit sends the gate's copy.** `send_commit` sends the recipient, service,
+  and text stored by the gate at request time, after checking the payload hash.
+  The request cannot substitute its own text.
+- **Fail closed.** If the gate is unreachable, rejects the token, or `gate.json`
+  has an incomplete gate section, reads return nothing and sends error out.
+  The helper does not fall back to the local allowlist.
+- **Pre-granted contacts send without a prompt**, by design: a `send` grant is
+  standing permission, so any same-user process can text that contact until
+  the grant expires or is revoked. Keep `send` grants short and few.
+- The gate itself, and whoever controls its host and database, are now part of
+  the trusted computing base for sending and reading.
+
+Standard (non-hardened) installs keep `gate.json` user-writable, so a gate
+there adds no protection against same-user processes.
+
 ## Confirmation gate (sending)
 
 Sending is confirmation-gated via a two-layer preview/confirm protocol:
@@ -220,9 +251,16 @@ precedence.
 
 ## What leaves the machine
 
-The helper itself does not make any outbound network connections. All
-message content read from `chat.db` or sent via AppleScript is
-processed on-device by the helper.
+Without an approval gate, the helper makes no outbound network connections.
+All message content read from `chat.db` or sent via AppleScript is processed
+on-device by the helper.
+
+With an approval gate configured (see below), the Full Disk Access process makes
+HTTPS requests to exactly one origin: the `gate_url` in the root-owned
+`gate.json`. Redirects and proxies are refused. Only the send payloads it asks
+you to approve (recipient handle, contact name, service, text) and grant
+requests leave the Mac, and only to that gate. Message history read from
+`chat.db` is never sent to the gate.
 
 When Grok Bot uses this skill, message content that Grok Bot reads
 passes through xAI's normal pipeline, which means it reaches

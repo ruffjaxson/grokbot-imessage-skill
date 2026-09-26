@@ -6,6 +6,20 @@ version reported by the `status` action.
 
 ## Unreleased
 
+- Added approval-gate mode (protocol 1.3) for hardened installs. When the
+  root-owned `gate.json` names an `imessage-gate` service, per-contact
+  `send` / `read` / `watch` grants come from the gate, and ungranted sends or
+  grant requests go to the owner's phone for passkey approval. New actions:
+  `send_commit` (sends the gate-stored payload of an approved send, once),
+  `request_grant`, `approval_status`, `list_grants`, `revoke_grant`, `inbox`,
+  and `watch_tick`. `contacts_lookup` reports scopes. Gate failures fail closed.
+- Added `bin/gate_client.py` (stdlib HTTPS client pinned to one origin). The
+  C wrapper validates it like the other trusted modules.
+- The hardened installer accepts `IMESSAGE_GATE_URL` and prompts for the helper
+  token without echoing it (or reads `IMESSAGE_GATE_TOKEN_FILE`). The new
+  `tools/configure_gate.py` writes `gate.json` atomically at mode 600.
+- Installs without a gate section behave exactly as before.
+
 ## 1.4.8 - 2026-09-13
 
 - Fixed `configure_allowlist.py` to work with hardened install layout where the
