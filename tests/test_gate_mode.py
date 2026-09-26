@@ -211,6 +211,16 @@ class GateModeTestCase(unittest.TestCase):
         helper._CONTACT_HANDLE_LABELS.update({"4155551234": "mobile", "4155559876": "home", BOB: "email 1"})
         self.addCleanup(self._restore_contacts, saved_raw, saved_labels)
 
+        # A clean Contacts load with readable notes, unless a test says otherwise.
+        for name, value in (
+            ("_CONTACTS_LOAD_OK", True),
+            ("_CONTACT_NOTES_OK", True),
+            ("_CONTACT_NAME_PARTS", {"Alice", "Example", "Carol", "Bob", "Ally", *CONTACTS.values()}),
+        ):
+            patcher = mock.patch.object(helper, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
         self.scripts: list[str] = []
         patcher = mock.patch.object(helper, "_run_osascript", side_effect=self._fake_osascript)
         patcher.start()
@@ -1491,13 +1501,55 @@ class UnknownSenderTests(GateModeTestCase):
 
     def test_save_contact_refuses_duplicate_names_and_blocked(self) -> None:
         for name in ("alice   EXAMPLE", "\u00c1lice Example", "Carol Example"):
-            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "already exists"):
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "looks like"):
                 self.run_action("save_contact", {"thread_ref": self.stranger_thread, "name": name})
         self.blocklist.write_text(STRANGER + "\n")
         with self.assertRaisesRegex(ValueError, "blocked"):
             self.run_action("save_contact", {"thread_ref": self.stranger_thread, "name": "Dave"})
         self.assertEqual(self.scripts, [])
         self.assertEqual(self.gate.grok_added, [])
+
+    def test_save_contact_refuses_look_alike_names(self) -> None:
+        for name in (
+            "Alice",                 # a first name, contained in "Alice Example"
+            "Alice Example.",        # punctuation
+            "Al-ice   Ex ample",     # spacing and punctuation
+            "\u0410lice Example",    # Cyrillic A
+            "\u0430l\u0456ce",        # Cyrillic a and i
+            "Carol Examp1e",         # digit look-alike
+            "Ally",                  # an existing nickname
+            "Alice Example Jr",      # contains a full existing name
+            "Lice",                  # contained in an existing name
+        ):
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "looks like"):
+                self.run_action("save_contact", {"thread_ref": self.stranger_thread, "name": name})
+        self.assertEqual(self.scripts, [])
+        self.run_action("save_contact", {"thread_ref": self.stranger_thread, "name": "Dave Plumber"})
+        self.assertEqual(len(self.scripts), 1)
+
+    def test_save_contact_refuses_when_contacts_did_not_load(self) -> None:
+        with mock.patch.object(helper, "_CONTACTS_LOAD_OK", False):
+            with self.assertRaisesRegex(RuntimeError, "Contacts didn't load"):
+                self.run_action("save_contact", {"thread_ref": self.stranger_thread, "name": "Dave Plumber"})
+        self.assertEqual(self.scripts, [])
+
+    def test_unreadable_notes_flag_every_contact(self) -> None:
+        self.gate.grants = [grant(1, ALICE, "send")]
+        self.assertEqual(self.policy().send, (ALICE,))
+        with mock.patch.object(helper, "_CONTACT_NOTES_OK", False):
+            self.assertEqual(helper.contact_origin(ALICE, CONTACTS), "added_by_grok")
+            self.assertEqual(self.policy().send, ())  # unflagged grants are dropped
+            result = helper.action_send({"to": ALICE, "text": "hi"}, None, CONTACTS, self.policy())
+            payload = self.gate.approvals[result["approval_id"]]["payload"]
+            self.assertEqual(payload["contact_origin"], "added_by_grok")  # the phone warns
+
+    def test_status_reports_contacts_health(self) -> None:
+        self.gate.grok_added = [ALICE]
+        helper.load_gate_policy(helper._GATE_CONTEXT, CONTACTS)
+        health = helper.action_status({}, None, {}, self.policy())["gate"]["contacts"]
+        self.assertEqual(health["loaded"], True)
+        self.assertEqual(health["notes_readable"], True)
+        self.assertEqual(health["grok_recorded_missing_marker"], 1)  # recorded on the gate, no note marker
 
     def test_save_contact_needs_the_gate_record(self) -> None:
         self.gate.record_grok_contact = mock.Mock(side_effect=gate_client.GateUnavailable("down"))

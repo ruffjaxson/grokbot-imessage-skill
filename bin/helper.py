@@ -645,6 +645,9 @@ _GATE_GROK_ADDED: set[str] = set()
 # whether their notes could be checked for the Grok marker.
 _CONTACTS_LOAD_OK = False
 _CONTACT_NOTES_OK = False
+# Every first/last/nickname/organization/full name in Contacts (save_contact
+# refuses look-alikes of any of them).
+_CONTACT_NAME_PARTS: set[str] = set()
 GROK_ADDED_MARKER = "Added by Grok Bot (grokbot-imessage)"
 GROK_CONTACTS_GROUP = "Added by Grok"
 
@@ -679,8 +682,9 @@ def load_contacts() -> dict[str, str]:
     how many handles were loaded so debugging doesn't require guessing.
     """
     global _CONTACT_RAW_HANDLES, _CONTACT_HANDLE_LABELS, _CONTACT_GROK_ADDED
-    global _CONTACTS_LOAD_OK, _CONTACT_NOTES_OK
+    global _CONTACTS_LOAD_OK, _CONTACT_NOTES_OK, _CONTACT_NAME_PARTS
     load_ok = True
+    name_parts: set[str] = set()
     notes_ok = True
     handle_to_name: dict[str, str] = {}
     raw_handles: dict[str, str] = {}
@@ -710,6 +714,13 @@ def load_contacts() -> dict[str, str]:
             # 1. Build Z_PK -> display name map. Person records get
             #    "First Last"; company records fall back to ZORGANIZATION.
             records: dict[int, str] = {}
+            try:
+                cur.execute("SELECT ZFIRSTNAME, ZLASTNAME, ZNICKNAME, ZORGANIZATION FROM ZABCDRECORD")
+                for row in cur.fetchall():
+                    name_parts.update(str(v).strip() for v in row if v and str(v).strip())
+            except sqlite3.Error as e:
+                load_ok = False
+                log(f"contacts: name columns unreadable on {p}: {e}")
             try:
                 cur.execute(
                     "SELECT Z_PK, ZFIRSTNAME, ZLASTNAME, ZORGANIZATION "
@@ -826,6 +837,7 @@ def load_contacts() -> dict[str, str]:
     _CONTACT_GROK_ADDED = grok_added
     _CONTACTS_LOAD_OK = load_ok and bool(handle_to_name)
     _CONTACT_NOTES_OK = notes_ok
+    _CONTACT_NAME_PARTS = name_parts | set(handle_to_name.values())
     log(f"contacts: loaded {len(handle_to_name)} handles "
         f"({total_phones} phones, {total_emails} emails) "
         f"from {len(db_files)} source(s)")
@@ -1166,6 +1178,10 @@ def contact_origin(handle: str, contacts: dict[str, str]) -> str:
     if not key or key not in contacts or canonical_handle(contact_raw_handle(key)) != handle:
         return "unknown"
     if key in _CONTACT_GROK_ADDED or handle in _GATE_GROK_ADDED or handle in _grok_added_registry():
+        return "added_by_grok"
+    if not _CONTACT_NOTES_OK:
+        # The Grok marker couldn't be checked, so this contact can't be proven
+        # to be one the user saved: flag it (approvals warn; unflagged grants drop).
         return "added_by_grok"
     return "contacts"
 
@@ -2558,6 +2574,21 @@ def action_list_chats(params, conn, contacts, privacy_policy):
     }
 
 
+def _contacts_health() -> dict[str, Any]:
+    """For doctor.py: is the "added by Grok" marker actually detectable?"""
+    missing = [
+        h
+        for h in _GATE_GROK_ADDED
+        if _normalize_handle(h) in _CONTACT_RAW_HANDLES and _normalize_handle(h) not in _CONTACT_GROK_ADDED
+    ]
+    return {
+        "loaded": _CONTACTS_LOAD_OK,
+        "notes_readable": _CONTACT_NOTES_OK,
+        "grok_marked": len(_CONTACT_GROK_ADDED),
+        "grok_recorded_missing_marker": len(missing),
+    }
+
+
 def _gate_status(policy: PrivacyPolicy) -> dict[str, Any]:
     ctx = gate_context()
     if not ctx.enabled:
@@ -2568,6 +2599,7 @@ def _gate_status(policy: PrivacyPolicy) -> dict[str, Any]:
         "reachable": policy.source == "gate" and policy.gate_error is None,
         "error": policy.gate_error,
         "grant_counts": {scope: len(getattr(policy, scope)) for scope in GRANT_SCOPES},
+        "contacts": _contacts_health(),
         "unknown_senders": "on" if policy.unknown_enabled else (
             f"off ({policy.unknown_blocked_reason})" if policy.unknown_blocked_reason else "off"
         ),
@@ -3471,11 +3503,44 @@ def validate_contact_name(v: Any) -> str:
     return name
 
 
-def _name_fingerprint(name: str) -> str:
-    """Case-, accent-, and whitespace-insensitive form for collision checks."""
-    decomposed = unicodedata.normalize("NFKD", name)
+# Common cross-script look-alikes (Cyrillic, Greek, Latin variants) mapped to
+# the Latin letter they imitate, applied after NFKC + casefold. A curated
+# subset of Unicode confusables: enough for names that pass validate_contact_name.
+_CONFUSABLES = str.maketrans({
+    "а": "a", "в": "b", "е": "e", "ё": "e", "һ": "h", "і": "i", "ї": "i", "ј": "j",
+    "к": "k", "м": "m", "н": "h", "о": "o", "р": "p", "с": "c", "т": "t", "у": "y",
+    "х": "x", "ѕ": "s", "ԁ": "d", "ԛ": "q", "ԝ": "w", "ӏ": "l", "ɡ": "g", "ɩ": "i",
+    "α": "a", "β": "b", "ε": "e", "η": "n", "ι": "i", "κ": "k", "ν": "v", "ο": "o",
+    "ρ": "p", "τ": "t", "υ": "u", "χ": "x", "ω": "w", "ϲ": "c", "ϳ": "j", "ı": "i",
+    "ł": "l", "ø": "o", "đ": "d", "ħ": "h", "ŀ": "l", "ß": "ss", "æ": "ae", "œ": "oe",
+    "0": "o", "1": "l", "3": "e", "5": "s",
+})
+
+
+def name_skeleton(name: str) -> str:
+    """NFKC, casefold, strip accents, map look-alikes, drop everything that
+    isn't a letter: "Аlice  Exam-ple." and "alice example" share a skeleton."""
+    folded = unicodedata.normalize("NFKC", name).casefold()
+    decomposed = unicodedata.normalize("NFKD", folded)
     stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
-    return " ".join(stripped.casefold().split())
+    mapped = stripped.translate(_CONFUSABLES)
+    return "".join(ch for ch in mapped if ch.isalpha())
+
+
+def name_conflict(name: str, existing_names: Iterable[str]) -> bool:
+    """True if `name` looks like any existing name or name part: equal, or
+    contained in one ("Alice" vs "Alice Example"), or containing a full
+    existing name of 4+ letters ("Alice Example Jr")."""
+    new = name_skeleton(name)
+    if not new:
+        return True
+    for existing in existing_names:
+        old = name_skeleton(existing)
+        if not old:
+            continue
+        if new == old or new in old or (len(old) >= 4 and old in new):
+            return True
+    return False
 
 
 def _save_contact_script(name: str, handle: str) -> str:
@@ -3521,9 +3586,13 @@ def action_save_contact(params, conn, contacts, privacy_policy):
         raise ValueError("that person is already in Contacts; Grok can't edit existing contacts")
     if is_blocked(handle, handle, policy):
         raise ValueError("refusing: that handle is in contacts/blocked_chats.txt")
-    fingerprint = _name_fingerprint(name)
-    if any(_name_fingerprint(existing) == fingerprint for existing in set(contacts.values())):
-        raise ValueError("a contact with that name already exists; ask the user for a different name")
+    if not _CONTACTS_LOAD_OK:
+        raise RuntimeError("Contacts didn't load completely; can't check for duplicates, so not saving")
+    if name_conflict(name, set(contacts.values()) | _CONTACT_NAME_PARTS):
+        raise ValueError(
+            "that name is the same as, or looks like, an existing contact's name; "
+            "ask the user for a clearly different name"
+        )
     # Record on the gate first (add-only, authoritative for "added by Grok").
     # If the gate can't record it, don't create the contact.
     try:
