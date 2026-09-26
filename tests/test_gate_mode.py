@@ -1306,7 +1306,16 @@ class InstallerGateTests(unittest.TestCase):
 
     def test_token_is_read_hidden_and_passed_on_stdin(self) -> None:
         self.assertIn("read -r -s -p", self.script)
-        self.assertIn('printf \'%s\\n\' "$GATE_TOKEN_INPUT" | sudo "$PYTHON3_PATH" -I "$CONFIGURE_GATE"', self.script)
+        self.assertIn(
+            'printf \'%s\\n\' "$GATE_TOKEN_INPUT" | sudo "$PYTHON3_PATH" -I "$CONFIGURE_GATE_INSTALLED"',
+            self.script,
+        )
+
+    def test_root_only_runs_root_owned_copies(self) -> None:
+        self.assertNotIn('sudo "$PYTHON3_PATH" -I "$CONFIGURE_GATE" ', self.script)
+        self.assertIn('"$CONFIGURE_GATE" "$CONFIGURE_GATE_INSTALLED"', self.script)
+        staged = self.script.index('"$CONFIGURE_GATE" "$CONFIGURE_GATE_INSTALLED"')
+        self.assertLess(staged, self.script.index('-I "$CONFIGURE_GATE_INSTALLED"'))
         for line in self.script.splitlines():
             if "GATE_TOKEN_INPUT" in line and "echo" in line:
                 self.fail(f"token may be echoed: {line.strip()}")

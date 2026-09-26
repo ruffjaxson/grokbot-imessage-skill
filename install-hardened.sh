@@ -37,6 +37,7 @@ GATE_JSON="$CONFIG_ROOT/gate.json"
 CONTACT_REFS_PY="$CODE_ROOT/bin/contact_refs.py"
 GATE_CLIENT_PY="$CODE_ROOT/bin/gate_client.py"
 CONFIGURE_GATE="$SOURCE_ROOT/tools/configure_gate.py"
+CONFIGURE_GATE_INSTALLED="$CODE_ROOT/tools/configure_gate.py"
 GATE_URL_INPUT="${IMESSAGE_GATE_URL:-}"
 GATE_TOKEN_FILE="${IMESSAGE_GATE_TOKEN_FILE:-}"
 GATE_TOKEN_INPUT=""
@@ -200,12 +201,17 @@ if [[ -L "$GATE_JSON" ]]; then
     echo "Error: hardened gate config must not be a symlink: $GATE_JSON" >&2
     exit 1
 fi
+# Only run root-owned copies as root: stage both files into the code root first.
+sudo "$INSTALL_BIN" -o root -g wheel -m 444 \
+    "$SOURCE_ROOT/bin/gate_client.py" "$GATE_CLIENT_PY"
+sudo "$INSTALL_BIN" -o root -g wheel -m 444 \
+    "$CONFIGURE_GATE" "$CONFIGURE_GATE_INSTALLED"
 if [[ -n "$GATE_URL_INPUT" ]]; then
-    printf '%s\n' "$GATE_TOKEN_INPUT" | sudo "$PYTHON3_PATH" -I "$CONFIGURE_GATE" \
+    printf '%s\n' "$GATE_TOKEN_INPUT" | sudo "$PYTHON3_PATH" -I "$CONFIGURE_GATE_INSTALLED" \
         --gate-json "$GATE_JSON" --gate-url "$GATE_URL_INPUT" --token-stdin
     GATE_TOKEN_INPUT=""
 else
-    sudo "$PYTHON3_PATH" -I "$CONFIGURE_GATE" --gate-json "$GATE_JSON"
+    sudo "$PYTHON3_PATH" -I "$CONFIGURE_GATE_INSTALLED" --gate-json "$GATE_JSON"
 fi
 if [[ -e "$GATE_JSON" ]]; then
     sudo "$CHOWN_BIN" root:wheel "$GATE_JSON"
