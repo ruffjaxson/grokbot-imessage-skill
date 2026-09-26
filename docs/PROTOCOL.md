@@ -34,7 +34,7 @@ relied on. Unknown role values fail closed: no action is served.
 | `contacts_lookup` | yes (policy-filtered) | yes | no |
 | `send_preview`, `send` | yes | no | draft only |
 | `send_commit`, `request_grant`, `approval_status` | yes (gate mode) | no | no |
-| `list_grants`, `revoke_grant`, `watch_tick` | yes (gate mode) | no | no |
+| `list_grants`, `revoke_grant`, `watch_tick`, `save_contact` | yes (gate mode) | no | no |
 | `inbox` | yes (gate mode) | no | yes (watch-scoped) |
 | `list_chats` | **no** | yes | no |
 
@@ -594,6 +594,17 @@ allowlist:
 - `read` and `watch` grants carry a **history floor** (`lookback`): `grant_time` (the
   default, only messages from the grant on), `7d`, `30d`, or `all`. The approver sets it on
   the phone. Every read and watch action drops messages older than the floor.
+- **Unknown senders:** a standing gate setting (turned on with a passkey on `/grants`,
+  with a rolling window of 24h, 7d, or 30d) lets read and watch actions include 1:1 threads
+  whose handle isn't in Contacts. They're labelled `"Unknown sender ···1234"` with
+  `"known": false`, plus `thread_ref` and `contact_ref`. `send`, `chat_history`, and
+  `request_grant` accept `thread_ref` (1:1 only) or an unsaved number's `contact_ref`; the
+  helper resolves both through chat.db.
+- **`save_contact {"thread_ref"|"contact_ref", "name"}`** creates a new Contacts entry through
+  Contacts.app scripting. The entry goes in the group "Added by Grok" with a marker note. It
+  refuses handles already in Contacts and grants nothing. Approvals and grants for such
+  contacts carry `contact_origin: "added_by_grok"`, which the phone page flags. The helper
+  refuses commits, and drops grants, where the flag is missing.
 - The local `blocked_chats.txt` still wins over every grant.
 - **Fail closed:** if the gate is unreachable, rejects the token, or `gate.json`
   names a gate incompletely, reads return nothing, sends and gate actions
