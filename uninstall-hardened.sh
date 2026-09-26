@@ -16,6 +16,9 @@ if [[ "$EUID" -eq 0 ]]; then
 fi
 
 LABEL="com.jeffhuber.grokbot-imessage"
+POWER_NAP_LABEL="com.jeffhuber.grokbot-imessage-power-nap.$UID"
+POWER_NAP_PLIST_DEST="/Library/LaunchDaemons/$POWER_NAP_LABEL.plist"
+POWER_NAP_STATE_DIR="/var/db/grokbot-imessage-power-nap/$UID"
 SKILL_DEST="${GROK_HOME:-$HOME/.grok}/skills/imessage-grok-bot"
 PRODUCT_ROOT="/Library/Application Support/GrokBotIMessage"
 USER_ROOT="$PRODUCT_ROOT/users/$UID"
@@ -32,6 +35,26 @@ for label in "$LABEL" "$LABEL-watch"; do
         echo "  removed $plist"
     fi
 done
+if sudo launchctl print "system/$POWER_NAP_LABEL" >/dev/null 2>&1; then
+    sudo launchctl bootout system "$POWER_NAP_PLIST_DEST"
+    echo "  launchd daemon $POWER_NAP_LABEL unloaded"
+fi
+if [[ -f "$POWER_NAP_PLIST_DEST" ]]; then
+    sudo "$RM_BIN" -f "$POWER_NAP_PLIST_DEST"
+    echo "  removed $POWER_NAP_PLIST_DEST"
+fi
+if [[ -d "$POWER_NAP_STATE_DIR" ]]; then
+    state_file="$POWER_NAP_STATE_DIR/next_wake.epoch"
+    if [[ -f "$state_file" ]]; then
+        read -r epoch < "$state_file" || true
+        if [[ "$epoch" =~ ^[0-9]+$ ]]; then
+            fmt="$(date -r "$epoch" "+%m/%d/%y %H:%M:%S")"
+            sudo /usr/bin/pmset schedule cancel wake "$fmt" "$POWER_NAP_LABEL" 2>/dev/null || true
+        fi
+    fi
+    sudo "$RM_BIN" -rf "$POWER_NAP_STATE_DIR"
+    echo "  removed power nap state $POWER_NAP_STATE_DIR"
+fi
 if [[ -d "$SKILL_DEST" ]]; then
     rm -rf "$SKILL_DEST"
     echo "  removed Grok skill $SKILL_DEST"

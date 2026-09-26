@@ -30,6 +30,12 @@ LABEL="com.jeffhuber.grokbot-imessage"
 WATCH_PLIST_TEMPLATE="$SOURCE_ROOT/com.jeffhuber.grokbot-imessage-watch.plist.template"
 WATCH_LABEL="com.jeffhuber.grokbot-imessage-watch"
 WATCH_PLIST_DEST="$HOME/Library/LaunchAgents/$WATCH_LABEL.plist"
+POWER_NAP_PLIST_TEMPLATE="$SOURCE_ROOT/com.jeffhuber.grokbot-imessage-power-nap.plist.template"
+POWER_NAP_LABEL="com.jeffhuber.grokbot-imessage-power-nap.$UID"
+POWER_NAP_INTERVAL_S="${POWER_NAP_INTERVAL_S:-420}"
+POWER_NAP_STATE_DIR="/var/db/grokbot-imessage-power-nap/$UID"
+POWER_NAP_LOG="/var/log/grokbot-imessage-power-nap-$UID.log"
+POWER_NAP_PLIST_DEST="/Library/LaunchDaemons/$POWER_NAP_LABEL.plist"
 LEGACY_LABEL="com.user.cowork-imessage"
 LEGACY_PLIST="$HOME/Library/LaunchAgents/$LEGACY_LABEL.plist"
 LEGACY_WRAPPER="$CODE_ROOT/bin/cowork-imessage-helper"
@@ -114,8 +120,10 @@ for path in \
     "$SOURCE_ROOT/contacts/allowed_chats.txt.template" \
     "$SOURCE_ROOT/install-skill.sh" \
     "$SOURCE_ROOT/tools/watch_tick.sh" \
+    "$SOURCE_ROOT/tools/power_nap_tick.sh" \
     "$SOURCE_ROOT/tools/configure_watch_webhook.sh" \
     "$WATCH_PLIST_TEMPLATE" \
+    "$POWER_NAP_PLIST_TEMPLATE" \
     "$PLIST_TEMPLATE"; do
     if [[ ! -f "$path" ]]; then
         echo "Error: missing source file: $path" >&2
@@ -364,7 +372,10 @@ sudo "$INSTALL_BIN" -o root -g wheel -m 555 \
 sudo "$INSTALL_BIN" -o root -g wheel -m 555 \
     "$SOURCE_ROOT/tools/watch_tick.sh" "$CODE_ROOT/tools/watch_tick.sh"
 sudo "$INSTALL_BIN" -o root -g wheel -m 555 \
+    "$SOURCE_ROOT/tools/power_nap_tick.sh" "$CODE_ROOT/tools/power_nap_tick.sh"
+sudo "$INSTALL_BIN" -o root -g wheel -m 555 \
     "$SOURCE_ROOT/tools/configure_watch_webhook.sh" "$CODE_ROOT/tools/configure_watch_webhook.sh"
+sudo "$INSTALL_BIN" -d -o root -g wheel -m 700 "$POWER_NAP_STATE_DIR"
 
 mkdir -p "$(dirname "$PLIST_DEST")"
 render_plist() {
@@ -384,6 +395,40 @@ PYGEN
 }
 render_plist "$PLIST_DEST" "$PLIST_TEMPLATE"
 render_plist "$WATCH_PLIST_DEST" "$WATCH_PLIST_TEMPLATE"
+render_power_nap_plist() {
+    local destination="$1"
+    "$PYTHON3_PATH" - "$destination" "$POWER_NAP_PLIST_TEMPLATE" "$CODE_ROOT" "$BRIDGE_ROOT" \
+        "$POWER_NAP_LABEL" "$POWER_NAP_INTERVAL_S" "$CURRENT_USER" "$UID" "$HOME" \
+        "$POWER_NAP_STATE_DIR" "$POWER_NAP_LOG" <<'PYGEN'
+import pathlib
+import sys
+import xml.etree.ElementTree as ET
+
+destination, template, code_root, bridge_root, label, interval_s, user, uid, home, state_dir, log = sys.argv[1:]
+replacements = {
+    "{{CODE_ROOT}}": code_root,
+    "{{BRIDGE_ROOT}}": bridge_root,
+    "{{POWER_NAP_LABEL}}": label,
+    "{{POWER_NAP_INTERVAL_S}}": interval_s,
+    "{{TARGET_USER}}": user,
+    "{{TARGET_UID}}": uid,
+    "{{TARGET_HOME}}": home,
+    "{{POWER_NAP_STATE_DIR}}": state_dir,
+    "{{POWER_NAP_LOG}}": log,
+}
+tree = ET.parse(template)
+for element in tree.getroot().iter():
+    if element.text:
+        for key, value in replacements.items():
+            element.text = element.text.replace(key, value)
+tree.write(destination, encoding="UTF-8", xml_declaration=True)
+PYGEN
+    chmod 644 "$destination"
+}
+POWER_NAP_PLIST_RENDERED="$(mktemp "${TMPDIR:-/tmp}/grokbot-power-nap.XXXXXX")"
+render_power_nap_plist "$POWER_NAP_PLIST_RENDERED"
+sudo "$INSTALL_BIN" -o root -g wheel -m 644 "$POWER_NAP_PLIST_RENDERED" "$POWER_NAP_PLIST_DEST"
+rm -f "$POWER_NAP_PLIST_RENDERED"
 
 if [[ -e "$LEGACY_PLIST" || -L "$LEGACY_PLIST" ]]; then
     if "$PYTHON3_PATH" "$LEGACY_MIGRATOR" \
@@ -413,6 +458,11 @@ if launchctl print "gui/$UID/$WATCH_LABEL" >/dev/null 2>&1; then
 fi
 launchctl bootstrap "gui/$UID" "$WATCH_PLIST_DEST"
 launchctl enable "gui/$UID/$WATCH_LABEL"
+if sudo launchctl print "system/$POWER_NAP_LABEL" >/dev/null 2>&1; then
+    sudo launchctl bootout system "$POWER_NAP_PLIST_DEST"
+fi
+sudo launchctl bootstrap system "$POWER_NAP_PLIST_DEST"
+sudo launchctl enable "system/$POWER_NAP_LABEL"
 PATH="$ORIGINAL_PATH" "$SOURCE_ROOT/install-skill.sh"
 
 cat <<EOF
@@ -435,6 +485,10 @@ Grant Full Disk Access to (remove and re-add it after every reinstall):
 
 Optional, proactive watch (Grok Bot webhook routine), after creating the routine:
   "$CODE_ROOT/tools/configure_watch_webhook.sh"
+
+While the Mac sleeps on AC power, the root LaunchDaemon $POWER_NAP_LABEL
+schedules pmset wake events about every ${POWER_NAP_INTERVAL_S}s and runs one
+watch tick after each wake. On battery it schedules nothing.
 
 Then verify:
   "$PYTHON3_PATH" "$CODE_ROOT/tools/doctor.py" --bridge "$BRIDGE_ROOT" --code-root "$CODE_ROOT"

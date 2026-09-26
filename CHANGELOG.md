@@ -25,6 +25,11 @@ version reported by the `status` action.
 - Added the `com.jeffhuber.grokbot-imessage-watch` LaunchAgent (`tools/watch_tick.sh`)
   and `tools/configure_watch_webhook.sh`. When watched messages arrive, it sends a
   content-free trigger to a Grok Bot webhook routine.
+- Added the root `com.jeffhuber.grokbot-imessage-power-nap.<uid>` LaunchDaemon
+  (`tools/power_nap_tick.sh`) for hardened installs. On AC power it chains
+  `pmset schedule wake` events about every seven minutes, runs one `watch_tick`
+  after a recent wake from sleep, and never holds sleep assertions. On battery it
+  cancels owned wake events. `doctor.py` reports daemon and schedule health.
 - `save_contact` refuses look-alike names and refuses to save when Contacts didn't
   fully load. Unreadable contact notes mark every contact as added by Grok.
 - Secret rotation (`IMESSAGE_GATE_ROTATE=1` or an upgrade from the readable

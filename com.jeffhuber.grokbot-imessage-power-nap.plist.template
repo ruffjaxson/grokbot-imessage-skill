@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.jeffhuber.grokbot-imessage-power-nap LaunchDaemon (root).
+
+  While the Mac sleeps on AC power, pmset schedule wake events (owned by this
+  label) wake it about every POWER_NAP_INTERVAL_S seconds. Each run of
+  power_nap_tick.sh performs one watch_tick when the machine has just woken,
+  then schedules the next wake and exits without preventing sleep.
+
+  When the Mac is already awake, power_nap_tick.sh is a no-op for the watch
+  (the user LaunchAgent handles 60 s ticks) but still refreshes the next wake
+  schedule on AC.
+
+  Filled in by install-hardened.sh.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{{POWER_NAP_LABEL}}</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>{{CODE_ROOT}}/tools/power_nap_tick.sh</string>
+  </array>
+
+  <key>StartInterval</key>
+  <integer>420</integer>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>{{POWER_NAP_LOG}}</string>
+
+  <key>StandardErrorPath</key>
+  <string>{{POWER_NAP_LOG}}</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>POWER_NAP_OWNER</key>
+    <string>{{POWER_NAP_LABEL}}</string>
+    <key>POWER_NAP_INTERVAL_S</key>
+    <string>{{POWER_NAP_INTERVAL_S}}</string>
+    <key>POWER_NAP_AWAKE_SKIP_S</key>
+    <string>180</string>
+    <key>POWER_NAP_TARGET_USER</key>
+    <string>{{TARGET_USER}}</string>
+    <key>POWER_NAP_TARGET_UID</key>
+    <string>{{TARGET_UID}}</string>
+    <key>POWER_NAP_TARGET_HOME</key>
+    <string>{{TARGET_HOME}}</string>
+    <key>POWER_NAP_CODE_ROOT</key>
+    <string>{{CODE_ROOT}}</string>
+    <key>POWER_NAP_BRIDGE_ROOT</key>
+    <string>{{BRIDGE_ROOT}}</string>
+    <key>POWER_NAP_STATE_DIR</key>
+    <string>{{POWER_NAP_STATE_DIR}}</string>
+    <key>POWER_NAP_LOG</key>
+    <string>{{POWER_NAP_LOG}}</string>
+  </dict>
+</dict>
+</plist>

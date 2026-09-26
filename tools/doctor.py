@@ -285,6 +285,51 @@ def inspect_install(args: argparse.Namespace) -> dict[str, Any]:
                 "pass" if result.returncode == 0 else "fail",
                 "LaunchAgent loaded" if result.returncode == 0 else "LaunchAgent not loaded",
             )
+            watch = run([launchctl, "print", f"gui/{uid}/com.jeffhuber.grokbot-imessage-watch"])
+            checks["watch_launchd"] = check(
+                "pass" if watch.returncode == 0 else "fail",
+                "watch LaunchAgent loaded" if watch.returncode == 0 else "watch LaunchAgent not loaded",
+            )
+            if hardened:
+                power_nap_label = f"com.jeffhuber.grokbot-imessage-power-nap.{uid}"
+                power_nap = run([launchctl, "print", f"system/{power_nap_label}"])
+                checks["power_nap_launchd"] = check(
+                    "pass" if power_nap.returncode == 0 else "fail",
+                    f"{power_nap_label} loaded"
+                    if power_nap.returncode == 0
+                    else f"{power_nap_label} not loaded",
+                )
+                script = code_root / "tools" / "power_nap_tick.sh"
+                script_ok = (
+                    script.is_file()
+                    and not has_symlink_component(script)
+                    and script.stat().st_uid == 0
+                    and mode(script) == 0o555
+                )
+                checks["power_nap_script"] = check(
+                    "pass" if script_ok else "fail",
+                    str(script),
+                )
+                pmset = run(["/usr/bin/pmset", "-g", "ps"])
+                on_ac = "AC Power" in (pmset.stdout or "")
+                sched = run(["/usr/bin/pmset", "-g", "sched"])
+                owned = [
+                    line.strip()
+                    for line in (sched.stdout or "").splitlines()
+                    if f"by '{power_nap_label}'" in line
+                ]
+                if on_ac:
+                    checks["power_nap_wake_schedule"] = check(
+                        "pass" if owned else "warn",
+                        owned[0] if owned else "no pmset wake scheduled on AC",
+                    )
+                else:
+                    checks["power_nap_wake_schedule"] = check(
+                        "pass" if not owned else "warn",
+                        "on battery; no wake expected"
+                        if not owned
+                        else f"wake still scheduled on battery: {owned[0]}",
+                    )
 
     if not args.skip_chat_db:
         chat_db = pathlib.Path.home() / "Library" / "Messages" / "chat.db"
