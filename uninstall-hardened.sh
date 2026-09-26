@@ -16,20 +16,22 @@ if [[ "$EUID" -eq 0 ]]; then
 fi
 
 LABEL="com.jeffhuber.grokbot-imessage"
-PLIST_DEST="$HOME/Library/LaunchAgents/$LABEL.plist"
 SKILL_DEST="${GROK_HOME:-$HOME/.grok}/skills/imessage-grok-bot"
 PRODUCT_ROOT="/Library/Application Support/GrokBotIMessage"
 USER_ROOT="$PRODUCT_ROOT/users/$UID"
 BRIDGE_ROOT="${GROKBOT_IMESSAGE_BRIDGE:-$HOME/Library/Application Support/GrokBotIMessage}"
 
-if launchctl print "gui/$UID/$LABEL" >/dev/null 2>&1; then
-    launchctl bootout "gui/$UID/$LABEL"
-    echo "  launchd agent unloaded"
-fi
-if [[ -f "$PLIST_DEST" ]]; then
-    rm -f "$PLIST_DEST"
-    echo "  removed $PLIST_DEST"
-fi
+for label in "$LABEL" "$LABEL-watch"; do
+    if launchctl print "gui/$UID/$label" >/dev/null 2>&1; then
+        launchctl bootout "gui/$UID/$label"
+        echo "  launchd agent $label unloaded"
+    fi
+    plist="$HOME/Library/LaunchAgents/$label.plist"
+    if [[ -f "$plist" ]]; then
+        rm -f "$plist"
+        echo "  removed $plist"
+    fi
+done
 if [[ -d "$SKILL_DEST" ]]; then
     rm -rf "$SKILL_DEST"
     echo "  removed Grok skill $SKILL_DEST"

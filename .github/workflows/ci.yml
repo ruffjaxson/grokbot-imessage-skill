@@ -28,7 +28,7 @@ jobs:
       - run: bash -n install-hardened.sh
       - run: bash -n uninstall.sh
       - run: bash -n uninstall-hardened.sh
-      - run: shellcheck install.sh install-hardened.sh install-skill.sh uninstall.sh uninstall-hardened.sh tools/select_python.sh tools/test.sh
+      - run: shellcheck install.sh install-hardened.sh install-skill.sh uninstall.sh uninstall-hardened.sh tools/select_python.sh tools/test.sh tools/watch_tick.sh tools/configure_watch_webhook.sh
 
   macos:
     runs-on: macos-latest
@@ -37,7 +37,7 @@ jobs:
         with:
           persist-credentials: false
       - run: IMESSAGE_TEST_PYTHON="$(command -v python3)" ./tools/test.sh v1.4.8
-      - run: plutil -lint com.jeffhuber.grokbot-imessage.plist.template
+      - run: plutil -lint com.jeffhuber.grokbot-imessage.plist.template com.jeffhuber.grokbot-imessage-watch.plist.template
       - name: Compile FDA wrapper
         run: >-
           clang -Wall -Wextra -Werror -O2

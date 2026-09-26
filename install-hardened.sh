@@ -27,6 +27,9 @@ BRIDGE_ROOT="${GROKBOT_IMESSAGE_BRIDGE:-$HOME/Library/Application Support/GrokBo
 PLIST_TEMPLATE="$SOURCE_ROOT/com.jeffhuber.grokbot-imessage.plist.template"
 PLIST_DEST="$HOME/Library/LaunchAgents/com.jeffhuber.grokbot-imessage.plist"
 LABEL="com.jeffhuber.grokbot-imessage"
+WATCH_PLIST_TEMPLATE="$SOURCE_ROOT/com.jeffhuber.grokbot-imessage-watch.plist.template"
+WATCH_LABEL="com.jeffhuber.grokbot-imessage-watch"
+WATCH_PLIST_DEST="$HOME/Library/LaunchAgents/$WATCH_LABEL.plist"
 LEGACY_LABEL="com.user.cowork-imessage"
 LEGACY_PLIST="$HOME/Library/LaunchAgents/$LEGACY_LABEL.plist"
 LEGACY_WRAPPER="$CODE_ROOT/bin/cowork-imessage-helper"
@@ -108,6 +111,9 @@ for path in \
     "$SOURCE_ROOT/contacts/blocked_chats.txt.template" \
     "$SOURCE_ROOT/contacts/allowed_chats.txt.template" \
     "$SOURCE_ROOT/install-skill.sh" \
+    "$SOURCE_ROOT/tools/watch_tick.sh" \
+    "$SOURCE_ROOT/tools/configure_watch_webhook.sh" \
+    "$WATCH_PLIST_TEMPLATE" \
     "$PLIST_TEMPLATE"; do
     if [[ ! -f "$path" ]]; then
         echo "Error: missing source file: $path" >&2
@@ -290,9 +296,14 @@ sudo "$INSTALL_BIN" -o root -g wheel -m 555 \
     "$SOURCE_ROOT/tools/doctor.py" "$CODE_ROOT/tools/doctor.py"
 sudo "$INSTALL_BIN" -o root -g wheel -m 555 \
     "$SOURCE_ROOT/tools/configure_allowlist.py" "$CODE_ROOT/tools/configure_allowlist.py"
+sudo "$INSTALL_BIN" -o root -g wheel -m 555 \
+    "$SOURCE_ROOT/tools/watch_tick.sh" "$CODE_ROOT/tools/watch_tick.sh"
+sudo "$INSTALL_BIN" -o root -g wheel -m 555 \
+    "$SOURCE_ROOT/tools/configure_watch_webhook.sh" "$CODE_ROOT/tools/configure_watch_webhook.sh"
 
 mkdir -p "$(dirname "$PLIST_DEST")"
-"$PYTHON3_PATH" - "$CODE_ROOT" "$BRIDGE_ROOT" "$PLIST_DEST" "$PLIST_TEMPLATE" <<'PYGEN'
+render_plist() {
+    "$PYTHON3_PATH" - "$CODE_ROOT" "$BRIDGE_ROOT" "$1" "$2" <<'PYGEN'
 import sys
 import xml.etree.ElementTree as ET
 
@@ -304,7 +315,10 @@ for element in tree.getroot().iter("string"):
         element.text = element.text.replace("{{BRIDGE_ROOT}}", bridge_root)
 tree.write(destination, encoding="UTF-8", xml_declaration=True)
 PYGEN
-chmod 644 "$PLIST_DEST"
+    chmod 644 "$1"
+}
+render_plist "$PLIST_DEST" "$PLIST_TEMPLATE"
+render_plist "$WATCH_PLIST_DEST" "$WATCH_PLIST_TEMPLATE"
 
 if [[ -e "$LEGACY_PLIST" || -L "$LEGACY_PLIST" ]]; then
     if "$PYTHON3_PATH" "$LEGACY_MIGRATOR" \
@@ -328,6 +342,12 @@ if launchctl print "gui/$UID/$LABEL" >/dev/null 2>&1; then
 fi
 launchctl bootstrap "gui/$UID" "$PLIST_DEST"
 launchctl enable "gui/$UID/$LABEL"
+# Watch trigger: no-op until a webhook is saved with configure_watch_webhook.sh.
+if launchctl print "gui/$UID/$WATCH_LABEL" >/dev/null 2>&1; then
+    launchctl bootout "gui/$UID/$WATCH_LABEL"
+fi
+launchctl bootstrap "gui/$UID" "$WATCH_PLIST_DEST"
+launchctl enable "gui/$UID/$WATCH_LABEL"
 PATH="$ORIGINAL_PATH" "$SOURCE_ROOT/install-skill.sh"
 
 cat <<EOF
@@ -347,6 +367,9 @@ Without a gate, add an allowed contact before reading:
 
 Grant Full Disk Access to (remove and re-add it after every reinstall):
   $CODE_ROOT/bin/grokbot-imessage-helper
+
+Optional, proactive watch (Grok Bot webhook routine), after creating the routine:
+  "$CODE_ROOT/tools/configure_watch_webhook.sh"
 
 Then verify:
   "$PYTHON3_PATH" "$CODE_ROOT/tools/doctor.py" --bridge "$BRIDGE_ROOT" --code-root "$CODE_ROOT"
