@@ -320,12 +320,140 @@ class ConfigureGateRotationTests(unittest.TestCase):
         self.assertEqual(json.loads(self.path.read_text())["helper_token"], new)
 
 
-@unittest.skipUnless(sys.platform == "darwin", "macOS codesign/DevToolsSecurity")
+def _load_doctor():
+    spec = importlib.util.spec_from_file_location("doctor_attach", REPO_ROOT / "tools" / "doctor.py")
+    doctor = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(doctor)
+    return doctor
+
+
 class DoctorAttachCheckTests(unittest.TestCase):
-    def test_python_attach_checks_report(self) -> None:
-        spec = importlib.util.spec_from_file_location("doctor_attach", REPO_ROOT / "tools" / "doctor.py")
-        doctor = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(doctor)
-        checks = doctor.python_attach_checks(skip_codesign=False)
-        self.assertIn(checks["python_not_debuggable"]["status"], ("pass", "fail"))
-        self.assertIn(checks["developer_mode_off"]["status"], ("pass", "warn"))
+    def setUp(self) -> None:
+        self.doctor = _load_doctor()
+        self._tmp = tempfile.TemporaryDirectory(prefix="doctor-attach-")
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.code_root = self.root / "code"
+        (self.code_root / "bin").mkdir(parents=True)
+
+    def framework_python(self) -> tuple[Path, Path]:
+        version = self.root / "Python3.framework" / "Versions" / "3.9"
+        launcher = version / "bin" / "python3.9"
+        app = version / "Resources" / "Python.app" / "Contents" / "MacOS" / "Python"
+        for path in (launcher, app):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"\xcf\xfa\xed\xfe")
+        return launcher, app
+
+    def install(self, interpreter: Path, *, baked: bool = True) -> None:
+        (self.code_root / "python-interpreter").write_text(f"{interpreter}\n")
+        body = b"\0prefix\0" + (str(interpreter).encode() if baked else b"/elsewhere") + b"\0"
+        (self.code_root / "bin" / "grokbot-imessage-helper").write_bytes(body)
+
+    def test_worker_images_follow_the_framework_app(self) -> None:
+        launcher, app = self.framework_python()
+        self.assertEqual(self.doctor.worker_images(launcher), [launcher, app])
+        self.assertEqual(self.doctor.worker_images(app), [app])
+
+    def test_baked_interpreter_must_be_in_the_wrapper(self) -> None:
+        launcher, _ = self.framework_python()
+        self.install(launcher)
+        checks = self.doctor.python_attach_checks(self.code_root, skip_codesign=True)
+        self.assertEqual(checks["python_interpreter_baked"]["status"], "pass")
+        self.install(launcher, baked=False)
+        checks = self.doctor.python_attach_checks(self.code_root, skip_codesign=True)
+        self.assertEqual(checks["python_interpreter_baked"]["status"], "fail")
+
+    def test_xcrun_shim_or_missing_record_fails(self) -> None:
+        self.install(Path("/usr/bin/python3"))
+        checks = self.doctor.python_attach_checks(self.code_root, skip_codesign=True)
+        self.assertEqual(checks["python_interpreter_baked"]["status"], "fail")
+        (self.code_root / "python-interpreter").unlink()
+        checks = self.doctor.python_attach_checks(self.code_root, skip_codesign=True)
+        self.assertEqual(checks["python_not_debuggable"]["status"], "fail")
+
+    def test_every_worker_image_is_codesign_checked(self) -> None:
+        launcher, app = self.framework_python()
+        self.install(launcher)
+        seen = []
+
+        def fake_run(command):
+            seen.append(command[-1])
+            if "--entitlements" in command:
+                entitlements = "com.apple.security.get-task-allow" if command[-1] == str(app) else ""
+                return subprocess.CompletedProcess(command, 0, entitlements, "")
+            return subprocess.CompletedProcess(command, 0, "", "Authority=Software Signing\nflags=0x0(none)")
+
+        with mock.patch.object(self.doctor, "run", side_effect=fake_run):
+            checks = self.doctor.python_attach_checks(self.code_root, skip_codesign=False)
+        self.assertIn(str(launcher), seen)
+        self.assertIn(str(app), seen)
+        self.assertEqual(checks["python_not_debuggable"]["status"], "fail")
+        self.assertIn(f"{app} apple=True get_task_allow=True", checks["python_not_debuggable"]["detail"])
+
+    @unittest.skipUnless(
+        sys.platform == "darwin"
+        and Path("/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework").is_dir(),
+        "Command Line Tools Python",
+    )
+    def test_command_line_tools_python_is_not_debuggable(self) -> None:
+        launcher = Path(
+            "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9"
+        )
+        self.install(launcher)
+        checks = self.doctor.python_attach_checks(self.code_root, skip_codesign=False)
+        self.assertEqual(checks["python_not_debuggable"]["status"], "pass", checks["python_not_debuggable"])
+        self.assertIn("Python.app/Contents/MacOS/Python", checks["python_not_debuggable"]["detail"])
+
+
+class DoctorContactsMarkerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.doctor = _load_doctor()
+
+    def marker(self, status):
+        with mock.patch.object(self.doctor, "helper_status", return_value=status):
+            return self.doctor.contacts_marker_check(Path("/nonexistent"))["grok_marker_detected"]["status"]
+
+    def test_marker_detected(self) -> None:
+        health = {"loaded": True, "notes_readable": True, "grok_marked": 2, "grok_recorded_missing_marker": 0}
+        self.assertEqual(self.marker({"gate": {"reachable": True, "contacts": health}}), "pass")
+
+    def test_unreadable_notes_or_missing_marker_fail(self) -> None:
+        unreadable = {"loaded": True, "notes_readable": False, "grok_marked": 0, "grok_recorded_missing_marker": 0}
+        self.assertEqual(self.marker({"gate": {"reachable": True, "contacts": unreadable}}), "fail")
+        missing = {"loaded": True, "notes_readable": True, "grok_marked": 0, "grok_recorded_missing_marker": 1}
+        self.assertEqual(self.marker({"gate": {"reachable": True, "contacts": missing}}), "fail")
+
+    def test_no_answer_or_unreachable_gate_warns(self) -> None:
+        self.assertEqual(self.marker(None), "warn")
+        health = {"loaded": False, "notes_readable": False, "grok_marked": 0, "grok_recorded_missing_marker": 0}
+        self.assertEqual(self.marker({"gate": {"reachable": False, "contacts": health}}), "warn")
+
+    def test_helper_status_round_trips_through_the_bridge(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="doctor-bridge-") as tmp:
+            bridge = Path(tmp)
+            (bridge / "control" / "requests").mkdir(parents=True)
+            (bridge / "control" / "responses").mkdir(parents=True)
+
+            def answer():
+                import time
+
+                for _ in range(200):
+                    requests = list((bridge / "control" / "requests").glob("request-*.json"))
+                    if requests:
+                        req = json.loads(requests[0].read_text())
+                        stem = requests[0].stem.replace("request-", "")
+                        (bridge / "control" / "responses" / f"response-{stem}.json").write_text(
+                            json.dumps({"id": req["id"], "ok": True, "action": req["action"], "gate": {}})
+                        )
+                        return
+                    time.sleep(0.01)
+
+            import threading
+
+            thread = threading.Thread(target=answer)
+            thread.start()
+            status = self.doctor.helper_status(bridge, timeout_s=5)
+            thread.join()
+            self.assertEqual(status["action"], "status")
+            self.assertEqual(list((bridge / "control" / "responses").iterdir()), [])

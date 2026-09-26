@@ -41,24 +41,47 @@ def run(command: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, capture_output=True, text=True, check=False)
 
 
-def python_attach_checks(*, skip_codesign: bool) -> dict[str, dict[str, str]]:
-    """The worker holds the gate secrets as an ordinary user process, so its
-    interpreter must not be debuggable by the user."""
+def worker_images(interpreter: pathlib.Path) -> list[pathlib.Path]:
+    """The baked interpreter plus the image it re-execs into: framework
+    launchers (Versions/X.Y/bin/pythonX.Y) exec Resources/Python.app, and
+    that process is the one holding the gate secrets."""
+    images = [interpreter]
+    if interpreter.parent.name == "bin" and interpreter.name.startswith("python"):
+        app = interpreter.parent.parent / "Resources" / "Python.app" / "Contents" / "MacOS" / "Python"
+        if app.is_file():
+            images.append(app)
+    return images
+
+
+def python_attach_checks(code_root: pathlib.Path, *, skip_codesign: bool) -> dict[str, dict[str, str]]:
+    """The worker holds the gate secrets as an ordinary user process, so the
+    images it actually runs must not be debuggable by the user."""
     out: dict[str, dict[str, str]] = {}
-    resolved = run(["/usr/bin/python3", "-I", "-c", "import os, sys; print(os.path.realpath(sys.executable))"])
-    real = resolved.stdout.strip()
-    if resolved.returncode != 0 or not real.startswith("/"):
-        return {"python_not_debuggable": check("fail", "could not resolve the real interpreter")}
+    record = code_root / "python-interpreter"
+    wrapper = code_root / "bin" / "grokbot-imessage-helper"
+    try:
+        baked = pathlib.Path(record.read_text(encoding="utf-8").strip())
+    except OSError:
+        return {"python_not_debuggable": check("fail", f"{record} missing; reinstall")}
+    in_wrapper = wrapper.is_file() and str(baked).encode() in wrapper.read_bytes()
+    shim = str(baked).startswith("/usr/bin/")
+    out["python_interpreter_baked"] = check(
+        "pass" if in_wrapper and not shim and baked.is_file() else "fail",
+        f"{baked} in_wrapper={in_wrapper} xcrun_shim={shim}",
+    )
     if not skip_codesign:
-        info = run(["/usr/bin/codesign", "-dv", "--verbose=4", real])
-        ents = run(["/usr/bin/codesign", "-d", "--entitlements", "-", real])
-        text = (info.stderr or "") + (info.stdout or "")
-        apple = "Authority=Software Signing" in text or "Platform identifier" in text
-        debuggable = "get-task-allow" in ((ents.stdout or "") + (ents.stderr or ""))
-        out["python_not_debuggable"] = check(
-            "pass" if apple and not debuggable else "fail",
-            f"{real} apple_signed={apple} get_task_allow={debuggable}",
-        )
+        details = []
+        ok = True
+        for image in worker_images(baked):
+            info = run(["/usr/bin/codesign", "-dv", "--verbose=4", str(image)])
+            ents = run(["/usr/bin/codesign", "-d", "--entitlements", "-", str(image)])
+            text = (info.stderr or "") + (info.stdout or "")
+            apple = "Authority=Software Signing" in text or "Platform identifier" in text
+            debuggable = "get-task-allow" in ((ents.stdout or "") + (ents.stderr or ""))
+            hardened = "(runtime)" in text
+            ok = ok and apple and not debuggable
+            details.append(f"{image} apple={apple} get_task_allow={debuggable} hardened_runtime={hardened}")
+        out["python_not_debuggable"] = check("pass" if ok else "fail", "; ".join(details))
     devtools = run(["/usr/sbin/DevToolsSecurity", "-status"])
     enabled = "enabled" in (devtools.stdout or "").lower() and "disabled" not in (devtools.stdout or "").lower()
     out["developer_mode_off"] = check(
@@ -66,6 +89,53 @@ def python_attach_checks(*, skip_codesign: bool) -> dict[str, dict[str, str]]:
         "Developer mode is on: debuggers may attach to the helper's Python" if enabled else "Developer mode is off",
     )
     return out
+
+
+def helper_status(bridge: pathlib.Path, timeout_s: float = 15.0) -> dict[str, Any] | None:
+    """Ask the running helper for `status` through the bridge (it has FDA; we don't)."""
+    import time
+    import uuid
+
+    rid = f"doctor-{uuid.uuid4().hex[:12]}"
+    requests = bridge / "control" / "requests"
+    response = bridge / "control" / "responses" / f"response-{rid}.json"
+    tmp = requests / f".request-{rid}.json.tmp"
+    try:
+        tmp.write_text(json.dumps({"id": rid, "action": "status", "params": {}}))
+        tmp.replace(requests / f"request-{rid}.json")
+    except OSError:
+        return None
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if response.is_file():
+            try:
+                return json.loads(response.read_text())
+            except (OSError, ValueError):
+                return None
+            finally:
+                response.unlink(missing_ok=True)
+        time.sleep(0.25)
+    (requests / f"request-{rid}.json").unlink(missing_ok=True)
+    return None
+
+
+def contacts_marker_check(bridge: pathlib.Path) -> dict[str, dict[str, str]]:
+    status = helper_status(bridge)
+    gate = (status or {}).get("gate") or {}
+    health = gate.get("contacts")
+    if not isinstance(health, dict):
+        return {"grok_marker_detected": check("warn", "helper didn't answer status (FDA granted? gate mode on?)")}
+    if gate.get("reachable") is not True:
+        # Contacts load with the gate policy, so there is nothing to judge yet.
+        return {"grok_marker_detected": check("warn", "approval gate unreachable; rerun doctor once it answers")}
+    ok = health.get("notes_readable") is True and health.get("grok_recorded_missing_marker", 1) == 0
+    return {
+        "grok_marker_detected": check(
+            "pass" if ok else "fail",
+            f"contacts_loaded={health.get('loaded')} notes_readable={health.get('notes_readable')} "
+            f"marked={health.get('grok_marked')} recorded_without_marker={health.get('grok_recorded_missing_marker')}",
+        )
+    }
 
 
 def inspect_install(args: argparse.Namespace) -> dict[str, Any]:
@@ -192,7 +262,9 @@ def inspect_install(args: argparse.Namespace) -> dict[str, Any]:
         checks["fda_wrapper_single_link"] = check(
             "pass" if links == 1 else "fail", f"{wrapper} st_nlink={links} (expected 1)"
         )
-        checks.update(python_attach_checks(skip_codesign=args.skip_codesign))
+        checks.update(python_attach_checks(code_root, skip_codesign=args.skip_codesign))
+        if not args.skip_chat_db:
+            checks.update(contacts_marker_check(bridge))
 
     if not args.skip_codesign:
         for name, path in executable_files.items():
