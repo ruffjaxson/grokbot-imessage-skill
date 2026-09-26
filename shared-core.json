@@ -32,9 +32,14 @@
       "sha256": "4b813be2f18a0985d29aef1c34da8be4d10f2ae6a8c1bce300fb77abf3042cd1"
     },
     {
+      "logical_name": "gate_client.py",
+      "path": "bin/gate_client.py",
+      "sha256": "28a4ee63d52c38b01e28069a8ff338771f532abf1dc02e3380676c8638677883"
+    },
+    {
       "logical_name": "imessage_helper.c",
       "path": "bin/imessage_helper.c",
-      "sha256": "2a1a504e87a13631f7f792b5e4a2a1d53e77e73ebad5ac012acdb622df911115"
+      "sha256": "e23f7e0565df45f2f9e9be71d53520d296851af3db915c9e8e07a461fb69091e"
     },
     {
       "logical_name": "confirm_imessage_send.m",

@@ -85,6 +85,10 @@ extern int _NSGetExecutablePath(char *buf, uint32_t *bufsize);
 /* Optional: contact-refs module path for validation and IMESSAGE_CONTACT_REFS_PATH. */
 #endif
 
+#ifndef GATE_CLIENT_SCRIPT
+/* Optional: approval-gate client path for validation and IMESSAGE_GATE_CLIENT_PATH. */
+#endif
+
 #ifndef REQUIRE_ROOT_POLICY
 #define REQUIRE_ROOT_POLICY 0
 #endif
@@ -865,6 +869,13 @@ int main(int argc, char **argv) {
         return validation;
     }
 #endif
+#ifdef GATE_CLIENT_SCRIPT
+    validation = validate_file(GATE_CLIENT_SCRIPT, "gate-client module",
+                               expected_code_uid, false);
+    if (validation != 0) {
+        return validation;
+    }
+#endif
 
 #if REQUIRE_ROOT_POLICY
     validation = validate_file(READ_ALLOWLIST_PATH, "read allowlist", 0, false);
@@ -907,6 +918,9 @@ int main(int argc, char **argv) {
 #ifdef CONTACT_REFS_SCRIPT
     static char contact_refs_buf[PATH_MAX + 64];
 #endif
+#ifdef GATE_CLIENT_SCRIPT
+    static char gate_client_buf[PATH_MAX + 64];
+#endif
 #ifdef IMESSAGE_GATE_PATH
     static char gate_path_buf[PATH_MAX + 64];
 #endif
@@ -931,6 +945,12 @@ int main(int argc, char **argv) {
 #ifdef CONTACT_REFS_SCRIPT
     if (set_env_value(contact_refs_buf, sizeof(contact_refs_buf),
                       "IMESSAGE_CONTACT_REFS_PATH", CONTACT_REFS_SCRIPT) != 0) {
+        return 7;
+    }
+#endif
+#ifdef GATE_CLIENT_SCRIPT
+    if (set_env_value(gate_client_buf, sizeof(gate_client_buf),
+                      "IMESSAGE_GATE_CLIENT_PATH", GATE_CLIENT_SCRIPT) != 0) {
         return 7;
     }
 #endif
@@ -965,10 +985,14 @@ int main(int argc, char **argv) {
         NULL,
         NULL,
         NULL,
+        NULL,
     };
-    size_t env_next = (sizeof(new_env) / sizeof(new_env[0])) - 4;
+    size_t env_next = (sizeof(new_env) / sizeof(new_env[0])) - 5;
 #ifdef CONTACT_REFS_SCRIPT
     new_env[env_next++] = contact_refs_buf;
+#endif
+#ifdef GATE_CLIENT_SCRIPT
+    new_env[env_next++] = gate_client_buf;
 #endif
 #ifdef IMESSAGE_GATE_PATH
     new_env[env_next++] = gate_path_buf;

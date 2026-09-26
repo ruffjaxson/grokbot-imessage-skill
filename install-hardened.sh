@@ -35,6 +35,11 @@ PYTHON_SELECTOR="$SOURCE_ROOT/tools/select_python.sh"
 ALLOWLIST="$CONFIG_ROOT/allowed_chats.txt"
 GATE_JSON="$CONFIG_ROOT/gate.json"
 CONTACT_REFS_PY="$CODE_ROOT/bin/contact_refs.py"
+GATE_CLIENT_PY="$CODE_ROOT/bin/gate_client.py"
+CONFIGURE_GATE="$SOURCE_ROOT/tools/configure_gate.py"
+GATE_URL_INPUT="${IMESSAGE_GATE_URL:-}"
+GATE_TOKEN_FILE="${IMESSAGE_GATE_TOKEN_FILE:-}"
+GATE_TOKEN_INPUT=""
 CURRENT_USER="$(id -un)"
 BUILD_DIR="$(mktemp -d -t grokbot-imessage-build.XXXXXX)"
 trap 'rm -rf "$BUILD_DIR"' EXIT
@@ -90,8 +95,10 @@ for path in \
     "$SOURCE_ROOT/bin/helper.py" \
     "$SOURCE_ROOT/bin/send_gate.py" \
     "$SOURCE_ROOT/bin/contact_refs.py" \
+    "$SOURCE_ROOT/bin/gate_client.py" \
     "$SOURCE_ROOT/bin/imessage_helper.c" \
     "$SOURCE_ROOT/contacts/gate.json.template" \
+    "$CONFIGURE_GATE" \
     "$SOURCE_ROOT/bin/confirm_imessage_send.m" \
     "$SOURCE_ROOT/tools/doctor.py" \
     "$SOURCE_ROOT/tools/configure_allowlist.py" \
@@ -106,6 +113,31 @@ for path in \
         exit 1
     fi
 done
+
+# Approval gate (optional). IMESSAGE_GATE_URL names the gate origin; the helper
+# token comes from IMESSAGE_GATE_TOKEN_FILE or a hidden prompt, and is passed to
+# configure_gate.py on stdin only. Without IMESSAGE_GATE_URL, an existing gate
+# section in gate.json is kept as-is.
+if [[ -n "$GATE_URL_INPUT" ]]; then
+    if [[ -n "$GATE_TOKEN_FILE" ]]; then
+        if [[ -L "$GATE_TOKEN_FILE" || ! -f "$GATE_TOKEN_FILE" ]]; then
+            echo "Error: IMESSAGE_GATE_TOKEN_FILE must be a regular file: $GATE_TOKEN_FILE" >&2
+            exit 1
+        fi
+        IFS= read -r GATE_TOKEN_INPUT < "$GATE_TOKEN_FILE" || true
+    elif [[ -t 0 ]]; then
+        IFS= read -r -s -p "Approval gate helper token for $GATE_URL_INPUT (input hidden): " \
+            GATE_TOKEN_INPUT
+        echo >&2
+    else
+        echo "Error: set IMESSAGE_GATE_TOKEN_FILE or run interactively to enter the helper token." >&2
+        exit 1
+    fi
+    if [[ -z "$GATE_TOKEN_INPUT" ]]; then
+        echo "Error: empty approval gate helper token." >&2
+        exit 1
+    fi
+fi
 
 for path in "$BRIDGE_ROOT/control" "$BRIDGE_ROOT/control/requests" \
     "$BRIDGE_ROOT/control/responses" "$BRIDGE_ROOT/contacts"; do
@@ -168,9 +200,12 @@ if [[ -L "$GATE_JSON" ]]; then
     echo "Error: hardened gate config must not be a symlink: $GATE_JSON" >&2
     exit 1
 fi
-if [[ ! -e "$GATE_JSON" ]]; then
-    "$PYTHON3_PATH" -c 'import json, secrets; print(json.dumps({"schema_version": 1, "contact_ref_hmac_key": secrets.token_urlsafe(32)}))' \
-        | sudo "$TEE_BIN" "$GATE_JSON" >/dev/null
+if [[ -n "$GATE_URL_INPUT" ]]; then
+    printf '%s\n' "$GATE_TOKEN_INPUT" | sudo "$PYTHON3_PATH" -I "$CONFIGURE_GATE" \
+        --gate-json "$GATE_JSON" --gate-url "$GATE_URL_INPUT" --token-stdin
+    GATE_TOKEN_INPUT=""
+else
+    sudo "$PYTHON3_PATH" -I "$CONFIGURE_GATE" --gate-json "$GATE_JSON"
 fi
 if [[ -e "$GATE_JSON" ]]; then
     sudo "$CHOWN_BIN" root:wheel "$GATE_JSON"
@@ -209,6 +244,7 @@ clang -Wall -Wextra -Werror -O2 \
     -DREAD_ALLOWLIST_PATH="\"$ALLOWLIST\"" \
     -DIMESSAGE_GATE_PATH="\"$GATE_JSON\"" \
     -DCONTACT_REFS_SCRIPT="\"$CONTACT_REFS_PY\"" \
+    -DGATE_CLIENT_SCRIPT="\"$GATE_CLIENT_PY\"" \
     -DREQUIRE_ROOT_POLICY=1 \
     -DHELPER_DISPLAY_NAME='"grokbot-imessage-helper"' \
     -DHOST_DISPLAY_NAME='"Grok Bot"' \
@@ -229,6 +265,8 @@ sudo "$INSTALL_BIN" -o root -g wheel -m 444 \
     "$SOURCE_ROOT/bin/send_gate.py" "$CODE_ROOT/bin/send_gate.py"
 sudo "$INSTALL_BIN" -o root -g wheel -m 444 \
     "$SOURCE_ROOT/bin/contact_refs.py" "$CODE_ROOT/bin/contact_refs.py"
+sudo "$INSTALL_BIN" -o root -g wheel -m 444 \
+    "$SOURCE_ROOT/bin/gate_client.py" "$GATE_CLIENT_PY"
 sudo "$INSTALL_BIN" -o root -g wheel -m 444 \
     "$SOURCE_ROOT/bin/imessage_helper.c" "$CODE_ROOT/bin/imessage_helper.c"
 sudo "$INSTALL_BIN" -o root -g wheel -m 444 \
@@ -287,9 +325,13 @@ Hardened install complete.
 
 Trusted code (root-owned): $CODE_ROOT
 Runtime bridge (user-owned): $BRIDGE_ROOT
-Read policy: root-owned allowlist (default-deny)
+Read policy: root-owned allowlist (default-deny), or approval-gate grants
+when gate.json names a gate (see "gate" in the doctor/status output).
 
-Add an allowed contact before reading:
+To enable or change the approval gate (token is prompted, never echoed):
+  IMESSAGE_GATE_URL=https://imessage-gate.example.ts.net ./install-hardened.sh
+
+Without a gate, add an allowed contact before reading:
   "$PYTHON3_PATH" "$CODE_ROOT/tools/configure_allowlist.py" add +15551234567
 
 Grant Full Disk Access to:

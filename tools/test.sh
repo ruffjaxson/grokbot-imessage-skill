@@ -34,8 +34,8 @@ cd "$REPO_ROOT"
 printf 'Test interpreter: %s (%s)\n' \
     "$TEST_PYTHON" "$("$TEST_PYTHON" -c 'import platform; print(platform.python_version())')"
 "$TEST_PYTHON" -m py_compile \
-    bin/helper.py bin/send_gate.py tools/doctor.py tools/check_shared_core.py \
-    tools/check_version.py tools/configure_allowlist.py \
+    bin/helper.py bin/send_gate.py bin/gate_client.py tools/doctor.py tools/check_shared_core.py \
+    tools/check_version.py tools/configure_allowlist.py tools/configure_gate.py \
     tools/migrate_legacy_launchagent.py
 "$TEST_PYTHON" -m unittest discover -s tests -v
 "$TEST_PYTHON" tools/check_privileged_paths.py

@@ -210,8 +210,8 @@ if [[ ! -f "$GATE_JSON" ]]; then
 fi
 
 # ---- 3. lock down Python code --------------------------------------------
-chmod 500 "$HELPER_PY" "$SEND_GATE_PY" "$CONTACT_REFS_PY"
-green "  chmod 500 $HELPER_PY, $SEND_GATE_PY, and $CONTACT_REFS_PY"
+chmod 500 "$HELPER_PY" "$SEND_GATE_PY" "$CONTACT_REFS_PY" "$BIN_DIR/gate_client.py"
+green "  chmod 500 $HELPER_PY, $SEND_GATE_PY, $CONTACT_REFS_PY, and gate_client.py"
 
 # ---- 4. build wrapper binary --------------------------------------------
 bold "Building wrapper binary..."
