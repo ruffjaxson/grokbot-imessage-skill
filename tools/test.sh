@@ -38,6 +38,7 @@ printf 'Test interpreter: %s (%s)\n' \
     tools/check_version.py tools/configure_allowlist.py \
     tools/migrate_legacy_launchagent.py
 "$TEST_PYTHON" -m unittest discover -s tests -v
+"$TEST_PYTHON" tools/check_privileged_paths.py
 "$TEST_PYTHON" tools/check_shared_core.py
 
 if [[ "$#" -eq 1 ]]; then

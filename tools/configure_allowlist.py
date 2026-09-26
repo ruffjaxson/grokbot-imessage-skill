@@ -23,6 +23,19 @@ EMAIL_RE = re.compile(
     rf"^{EMAIL_ATOM}(?:\.{EMAIL_ATOM})*@{EMAIL_LABEL}(?:\.{EMAIL_LABEL})+$"
 )
 CHAT_RE = re.compile(r"^chat[A-Za-z0-9;_+.-]+$")
+_PRIVILEGED_PATH_DIRS = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
+
+
+def _privileged_tool(name: str) -> str:
+    """Resolve a system tool path without hardcoding /usr/bin vs /usr/sbin."""
+    for directory in _PRIVILEGED_PATH_DIRS:
+        candidate = Path(directory) / name
+        try:
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+        except OSError:
+            continue
+    raise RuntimeError(f"required privileged tool not found: {name}")
 
 
 def _normalize_macos_firmlinks(path: str) -> str:
@@ -154,8 +167,8 @@ def install_entries(path: Path, entries: list[str]) -> None:
             temporary = Path(handle.name)
         subprocess.run(
             [
-                "/usr/bin/sudo",
-                "/usr/bin/install",
+                _privileged_tool("sudo"),
+                _privileged_tool("install"),
                 "-o",
                 "root",
                 "-g",
@@ -183,11 +196,14 @@ def install_entries(path: Path, entries: list[str]) -> None:
         except OSError as e:
             raise RuntimeError(f"allowlist verification failed: {e}")
         
-        subprocess.run(["/usr/bin/sudo", "/bin/chmod", "-N", str(path)], check=True)
+        subprocess.run(
+            [_privileged_tool("sudo"), _privileged_tool("chmod"), "-N", str(path)],
+            check=True,
+        )
         subprocess.run(
             [
-                "/usr/bin/sudo",
-                "/bin/chmod",
+                _privileged_tool("sudo"),
+                _privileged_tool("chmod"),
                 "+a",
                 f"user:{pwd.getpwuid(os.getuid()).pw_name} allow read",
                 str(path),
