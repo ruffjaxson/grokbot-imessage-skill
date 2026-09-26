@@ -583,6 +583,24 @@ def _normalize_handle(h: str) -> str:
 
 
 _CONTACT_RAW_HANDLES: dict[str, str] = {}
+_CONTACT_HANDLE_LABELS: dict[str, str] = {}
+
+
+def _decode_addressbook_label(raw: str | None) -> str:
+    """Normalize an AddressBook ZLABEL value to a short lowercase label."""
+    if not raw or not str(raw).strip():
+        return ""
+    s = str(raw).strip()
+    if s.startswith("_$!<") and s.endswith(">!$_"):
+        s = s[4:-4]
+    else:
+        s = s.replace("_$!<", "").replace(">!$_", "")
+    return s.strip().lower()
+
+
+def contact_handle_label(normalized: str) -> str:
+    """Return the AddressBook label for a normalized handle key."""
+    return _CONTACT_HANDLE_LABELS.get(normalized, "")
 
 
 def contact_raw_handle(normalized: str) -> str:
@@ -597,9 +615,12 @@ def load_contacts() -> dict[str, str]:
     CardDAV/iCloud sources). Loads phones, emails, and organizations. Logs
     how many handles were loaded so debugging doesn't require guessing.
     """
-    global _CONTACT_RAW_HANDLES
+    global _CONTACT_RAW_HANDLES, _CONTACT_HANDLE_LABELS
     handle_to_name: dict[str, str] = {}
     raw_handles: dict[str, str] = {}
+    handle_labels: dict[str, str] = {}
+    owner_phone_count: dict[int, int] = {}
+    owner_email_count: dict[int, int] = {}
     db_files: list[str] = []
     for pattern in _ADDRESSBOOK_PATTERNS:
         db_files.extend(glob.glob(os.path.expanduser(pattern)))
@@ -642,16 +663,30 @@ def load_contacts() -> dict[str, str]:
 
             # 2. Phone numbers.
             try:
-                cur.execute("SELECT ZOWNER, ZFULLNUMBER FROM ZABCDPHONENUMBER")
-                for owner, num in cur.fetchall():
+                try:
+                    cur.execute(
+                        "SELECT ZOWNER, ZFULLNUMBER, ZLABEL, ZORDERINGINDEX "
+                        "FROM ZABCDPHONENUMBER "
+                        "ORDER BY ZOWNER, ZORDERINGINDEX"
+                    )
+                    phone_rows = cur.fetchall()
+                except sqlite3.Error:
+                    cur.execute("SELECT ZOWNER, ZFULLNUMBER FROM ZABCDPHONENUMBER")
+                    phone_rows = [(o, n, None, 0) for (o, n) in cur.fetchall()]
+                for owner, num, zlabel, _ordering in phone_rows:
                     if owner not in records or not num:
                         continue
                     digits = re.sub(r"[^0-9]", "", num)
                     if len(digits) >= 10:
                         key = digits[-10:]
+                        label = _decode_addressbook_label(zlabel)
+                        if not label:
+                            owner_phone_count[owner] = owner_phone_count.get(owner, 0) + 1
+                            label = f"phone {owner_phone_count[owner]}"
                         if handle_to_name.setdefault(key, records[owner]) \
                                 is records[owner]:
                             raw_handles.setdefault(key, num.strip())
+                            handle_labels.setdefault(key, label)
                             total_phones += 1
             except sqlite3.Error as e:
                 log(f"contacts: phones table error on {p}: {e}")
@@ -659,25 +694,40 @@ def load_contacts() -> dict[str, str]:
             # 3. Email addresses. Prefer the normalized form, fall back to raw.
             try:
                 cur.execute(
-                    "SELECT ZOWNER, ZADDRESSNORMALIZED, ZADDRESS FROM ZABCDEMAILADDRESS"
+                    "SELECT ZOWNER, ZADDRESSNORMALIZED, ZADDRESS, ZLABEL, ZORDERINGINDEX "
+                    "FROM ZABCDEMAILADDRESS "
+                    "ORDER BY ZOWNER, ZORDERINGINDEX"
                 )
                 rows = cur.fetchall()
             except sqlite3.Error:
                 # Older schema may not have ZADDRESSNORMALIZED.
                 try:
-                    cur.execute("SELECT ZOWNER, ZADDRESS FROM ZABCDEMAILADDRESS")
-                    rows = [(o, None, a) for (o, a) in cur.fetchall()]
-                except sqlite3.Error as e:
-                    log(f"contacts: emails table error on {p}: {e}")
-                    rows = []
-            for owner, norm, raw in rows:
+                    cur.execute(
+                        "SELECT ZOWNER, ZADDRESS, ZLABEL, ZORDERINGINDEX "
+                        "FROM ZABCDEMAILADDRESS "
+                        "ORDER BY ZOWNER, ZORDERINGINDEX"
+                    )
+                    rows = [(o, None, a, lbl, ord_idx) for (o, a, lbl, ord_idx) in cur.fetchall()]
+                except sqlite3.Error:
+                    try:
+                        cur.execute("SELECT ZOWNER, ZADDRESS FROM ZABCDEMAILADDRESS")
+                        rows = [(o, None, a, None, 0) for (o, a) in cur.fetchall()]
+                    except sqlite3.Error as e:
+                        log(f"contacts: emails table error on {p}: {e}")
+                        rows = []
+            for owner, norm, raw, zlabel, _ordering in rows:
                 if owner not in records:
                     continue
                 addr = (norm or raw or "").strip().lower()
                 if addr and "@" in addr:
+                    label = _decode_addressbook_label(zlabel)
+                    if not label:
+                        owner_email_count[owner] = owner_email_count.get(owner, 0) + 1
+                        label = f"email {owner_email_count[owner]}"
                     if handle_to_name.setdefault(addr, records[owner]) \
                             is records[owner]:
                         raw_handles.setdefault(addr, addr)
+                        handle_labels.setdefault(addr, label)
                         total_emails += 1
 
             conn.close()
@@ -685,6 +735,7 @@ def load_contacts() -> dict[str, str]:
             log(f"contacts: warn on {p}: {e}")
 
     _CONTACT_RAW_HANDLES = raw_handles
+    _CONTACT_HANDLE_LABELS = handle_labels
     log(f"contacts: loaded {len(handle_to_name)} handles "
         f"({total_phones} phones, {total_emails} emails) "
         f"from {len(db_files)} source(s)")
@@ -1167,6 +1218,7 @@ def _agent_recipient_view(
     return _contact_refs.lookup_match(
         normalized,
         _resolve_contact_name(to, contacts),
+        contact_handle_label(normalized) or ("email" if "@" in normalized else "phone"),
     )
 
 
@@ -1715,7 +1767,10 @@ def action_contacts_lookup(params, conn, contacts, privacy_policy):
         if bridge_role() != "manager" and is_blocked(handle, handle, privacy_policy):
             continue
         if nl in full_name.lower():
-            matches.append(_contact_refs.lookup_match(handle, full_name))
+            label = contact_handle_label(handle) or (
+                "email" if "@" in handle else "phone"
+            )
+            matches.append(_contact_refs.lookup_match(handle, full_name, label))
     return {"query": name, "match_count": len(matches), "matches": matches[:25]}
 
 
