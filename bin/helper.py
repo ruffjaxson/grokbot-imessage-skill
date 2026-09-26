@@ -988,12 +988,14 @@ class PrivacyPolicy:
     send: tuple[str, ...] = ()
     grants: tuple[Any, ...] = field(default=(), compare=False, hash=False)
     gate_error: str | None = None
-    # Canonical watched handle -> Apple-epoch ns of its earliest watch grant.
-    # watch reads never reach back before the grant existed.
-    watch_since: dict[str, int] = field(default_factory=dict, compare=False, hash=False)
+    # Canonical handle -> Apple-epoch ns history floor for read / watch grants
+    # (None = no floor, i.e. lookback "all"). Reads never reach below it.
+    read_since: dict[str, int | None] = field(default_factory=dict, compare=False, hash=False)
+    watch_since: dict[str, int | None] = field(default_factory=dict, compare=False, hash=False)
 
 
 GRANT_SCOPES = ("send", "read", "watch")
+LOOKBACKS = ("grant_time", "7d", "30d", "all")
 GATE_UNAVAILABLE_MESSAGE = "approval gate unavailable"
 
 
@@ -1008,17 +1010,14 @@ def canonical_handle(value: str) -> str | None:
         return None
 
 
-def _grant_match(chat_id: str, sender: str, handles: tuple[str, ...]) -> bool:
-    """Grants match on exact canonical handles only. The last-10-digit
-    matching in _matches_list is kept for the blocklist, where matching too
-    much fails safe; for grants it would authorize look-alike handles."""
-    if not handles:
-        return False
-    allowed = set(handles)
-    return any(
-        (c := canonical_handle(candidate)) is not None and c in allowed
-        for candidate in (chat_id, sender)
-    )
+def _grant_match(chat_id: str, handles: tuple[str, ...]) -> bool:
+    """A per-contact grant covers only the 1:1 thread with that exact
+    canonical handle. Group threads (chat ids like "chat123…") never match,
+    even for messages the granted contact sent there: a group carries other
+    people's messages and names. The last-10-digit matching in _matches_list
+    is kept for the blocklist, where matching too much fails safe."""
+    c = canonical_handle(chat_id)
+    return c is not None and c in set(handles)
 
 
 def scoped_policy(policy: PrivacyPolicy | list[str], scope: str) -> PrivacyPolicy:
@@ -1038,16 +1037,27 @@ def grant_scopes_for(handle: str, policy: PrivacyPolicy | list[str]) -> list[str
     )
 
 
-def watch_floor_ok(chat_id: str, sender: str, ts_ns: int, policy: PrivacyPolicy | list[str]) -> bool:
-    """Gate mode: a watched message must be newer than the watch grant."""
+def history_floor_ok(chat_id: str, ts_ns: int, policy: PrivacyPolicy | list[str], scope: str) -> bool:
+    """Gate mode: a read/watch message must be at or above that grant's
+    history floor (lookback). Local mode: always True."""
     resolved = _coerce_policy(policy)
     if resolved.source != "gate":
         return True
-    for candidate in (chat_id, sender):
-        c = canonical_handle(candidate)
-        if c is not None and c in resolved.watch_since and ts_ns >= resolved.watch_since[c]:
-            return True
-    return False
+    since = resolved.read_since if scope == "read" else resolved.watch_since
+    c = canonical_handle(chat_id)
+    if c is None or c not in since:
+        return False
+    floor = since[c]
+    return floor is None or ts_ns >= floor
+
+
+def apply_scope(msgs: list[dict], policy: PrivacyPolicy | list[str], scope: str) -> list[dict]:
+    """Read policy plus the scope's history floor."""
+    return [
+        m
+        for m in apply_read_policy(msgs, policy)
+        if history_floor_ok(m["chat_id"], m["ts_ns"], policy, scope)
+    ]
 
 
 _INVISIBLE_CONTROLS_RE = re.compile("[\u202a-\u202e\u2066-\u2069\u200b\u2060\ufeff]")
@@ -1197,6 +1207,13 @@ def _normalize_grants(raw: list[Any], contacts: dict[str, str]) -> tuple[dict[st
         if display_name != expected_display_name(handle, contacts):
             log(f"gate: dropping grant {gid}: display name does not match local contacts")
             continue
+        lookback = g.get("lookback")
+        if lookback not in (None, *LOOKBACKS):
+            continue
+        # lookback "all" = no floor. Otherwise use the gate's floor, falling
+        # back to the grant's creation (the most conservative choice) when an
+        # older gate doesn't send one.
+        floor = None if lookback == "all" else (_parse_iso(g.get("history_floor_at")) or created)
         grants.append(
             {
                 "id": gid,
@@ -1205,6 +1222,8 @@ def _normalize_grants(raw: list[Any], contacts: dict[str, str]) -> tuple[dict[st
                 "scope": scope,
                 "expires_at": expires,
                 "created_at": created,
+                "lookback": lookback or ("grant_time" if scope != "send" else None),
+                "history_floor": floor,
             }
         )
     return tuple(grants)
@@ -1226,11 +1245,17 @@ def load_gate_policy(ctx: GateContext, contacts: dict[str, str] | None = None) -
         scope: tuple(g["handle"] for g in grants if g["scope"] == scope)
         for scope in GRANT_SCOPES
     }
-    watch_since: dict[str, int] = {}
+    since: dict[str, dict[str, int | None]] = {"read": {}, "watch": {}}
     for g in grants:
-        if g["scope"] == "watch":
-            ns = to_apple_ns(g["created_at"].timestamp())
-            watch_since[g["handle"]] = min(ns, watch_since.get(g["handle"], ns))
+        if g["scope"] not in since:
+            continue
+        floor = None if g["history_floor"] is None else to_apple_ns(g["history_floor"].timestamp())
+        bucket = since[g["scope"]]
+        if g["handle"] not in bucket:
+            bucket[g["handle"]] = floor
+        elif bucket[g["handle"]] is not None:
+            # Several grants for one contact: the most generous floor wins.
+            bucket[g["handle"]] = None if floor is None else min(floor, bucket[g["handle"]])
     return replace(
         closed,
         allowlist=by_scope["read"],
@@ -1238,7 +1263,8 @@ def load_gate_policy(ctx: GateContext, contacts: dict[str, str] | None = None) -
         watch=by_scope["watch"],
         send=by_scope["send"],
         grants=grants,
-        watch_since=watch_since,
+        read_since=since["read"],
+        watch_since=since["watch"],
     )
 
 
@@ -1398,7 +1424,7 @@ def is_read_allowed(chat_id: str, sender: str, policy: PrivacyPolicy | list[str]
     if is_blocked(chat_id, sender, resolved):
         return False
     if resolved.source == "gate":
-        return _grant_match(chat_id, sender, resolved.allowlist)
+        return _grant_match(chat_id, resolved.allowlist)
     if resolved.mode == "allowlist":
         return bool(_matches_list(chat_id, sender, resolved.allowlist))
     return True
@@ -2018,11 +2044,7 @@ def action_review(params, conn, contacts, privacy_policy):
     cutoff_ns = to_apple_ns(time.time() - days * 86400)
     msgs = fetch_messages(conn, cutoff_ns)
     watch_policy = scoped_policy(privacy_policy, "watch")
-    msgs = [
-        m
-        for m in apply_read_policy(msgs, watch_policy)
-        if watch_floor_ok(m["chat_id"], m["sender"], m["ts_ns"], watch_policy)
-    ]
+    msgs = apply_scope(msgs, watch_policy, "watch")
     participants = load_chat_participants(conn)
     needs_reply, low_priority, skip = classify_chats(msgs, contacts, participants)
     return {
@@ -2055,7 +2077,7 @@ def action_search(params, conn, contacts, privacy_policy):
     limit = validate_limit(params.get("limit", 100))
     cutoff_ns = to_apple_ns(time.time() - days * 86400)
     msgs = fetch_messages(conn, cutoff_ns, search=term)
-    msgs = apply_read_policy(msgs, privacy_policy)
+    msgs = apply_scope(msgs, privacy_policy, "read")
     # Sort descending by timestamp so newest matches come first.
     msgs.sort(key=lambda x: x["ts_ns"], reverse=True)
     msgs = msgs[:limit]
@@ -2130,7 +2152,7 @@ def action_chat_history(params, conn, contacts, privacy_policy):
     )
     cutoff_ns = to_apple_ns(time.time() - days * 86400)
     msgs = fetch_target_messages(conn, cutoff_ns, target)
-    msgs = apply_read_policy(msgs, privacy_policy)
+    msgs = apply_scope(msgs, privacy_policy, "read")
     msgs.sort(key=lambda x: x["ts_ns"])
     msgs = msgs[-limit:]
     participants = _participants_if_groups(conn, msgs)
@@ -2150,7 +2172,7 @@ def action_response_stats(params, conn, contacts, privacy_policy):
     )
     cutoff_ns = to_apple_ns(time.time() - hours * 3600)
     msgs = fetch_target_messages(conn, cutoff_ns, target)
-    msgs = apply_read_policy(msgs, privacy_policy)
+    msgs = apply_scope(msgs, privacy_policy, "read")
     msgs.sort(key=lambda x: x["ts_ns"])
 
     deltas: list[float] = []
@@ -2830,13 +2852,48 @@ def action_send_commit(params, conn, contacts, privacy_policy):
 action_send_commit.needs_db = False  # type: ignore[attr-defined]
 
 
+STANDARD_DURATIONS = ("1d", "1w")
+
+
+def resolve_grant_request(params: dict[str, Any]) -> tuple[list[str], int | None, str | None]:
+    """(scopes, duration_seconds, lookback) for request_grant.
+
+    preset "trusted": permanent send + read (+ watch if asked), lookback default "all".
+    preset "standard": send only, duration "1d" (default) or "1w".
+    no preset: explicit scopes + duration; read/watch lookback defaults to "grant_time".
+    The approver can still pick a different preset on their phone.
+    """
+    preset = params.get("preset")
+    lookback = params.get("lookback")
+    if lookback is not None and lookback not in LOOKBACKS:
+        raise ValueError(f"lookback must be one of {LOOKBACKS}")
+    if preset == "trusted":
+        extra = validate_scopes(params["scopes"]) if params.get("scopes") else []
+        scopes = sorted({"send", "read"} | ({"watch"} if "watch" in extra else set()))
+        return scopes, None, lookback or "all"
+    if preset == "standard":
+        if lookback is not None:
+            raise ValueError("the standard preset is send-only; request read separately")
+        duration = params.get("duration") or "1d"
+        if duration not in STANDARD_DURATIONS:
+            raise ValueError(f"standard duration must be one of {STANDARD_DURATIONS}")
+        return ["send"], parse_grant_duration(duration), None
+    if preset is not None:
+        raise ValueError("preset must be 'trusted' or 'standard'")
+    scopes = validate_scopes(params.get("scopes"))
+    duration = parse_grant_duration(params.get("duration"))
+    history = any(s in ("read", "watch") for s in scopes)
+    if lookback is not None and not history:
+        raise ValueError("lookback only applies to read or watch")
+    return scopes, duration, (lookback or "grant_time") if history else None
+
+
 def action_request_grant(params, conn, contacts, privacy_policy):
     ctx, policy = _require_gate(privacy_policy)
     to = resolve_send_recipient(params, contacts)
     if is_blocked(to, to, policy):
         raise ValueError("refusing: contact is in contacts/blocked_chats.txt")
-    scopes = validate_scopes(params.get("scopes"))
-    duration = parse_grant_duration(params.get("duration"))
+    scopes, duration, lookback = resolve_grant_request(params)
     handle = gate_handle(to)
     payload = {
         "handle": handle,
@@ -2844,6 +2901,8 @@ def action_request_grant(params, conn, contacts, privacy_policy):
         "scopes": scopes,
         "duration_seconds": duration,
     }
+    if lookback is not None:
+        payload["lookback"] = lookback
     try:
         approval = _gate_call(ctx, ctx.client.create_approval, "grant", payload)
     except ctx.module.GateError as exc:
@@ -2856,6 +2915,7 @@ def action_request_grant(params, conn, contacts, privacy_policy):
         "recipient": _agent_recipient_view(handle, contacts),
         "scopes": scopes,
         "duration_seconds": duration,
+        "lookback": lookback,
     }
 
 
@@ -2899,6 +2959,10 @@ def _grant_view(grant: dict[str, Any], contacts: dict[str, str]) -> dict[str, An
         "grant_id": grant["id"],
         "scope": grant["scope"],
         "expires_at": grant["expires_at"],
+        "lookback": grant.get("lookback"),
+        "history_from": grant["history_floor"].isoformat()
+        if grant.get("history_floor") is not None
+        else None,
         "name": contacts.get(key) or grant["display_name"],
         "label": contact_handle_label(key) or ("email" if "@" in key else "phone"),
         "service": _contact_refs.contact_service(key),
@@ -3071,8 +3135,8 @@ def action_watch_tick(params, conn, contacts, privacy_policy):
         if rowid in seen:
             continue
         chat_id, sender = _decode_db_text(chat_id), _decode_db_text(sender)
-        if is_read_allowed(chat_id, sender, watch_policy) and watch_floor_ok(
-            chat_id, sender, date_ns, watch_policy
+        if is_read_allowed(chat_id, sender, watch_policy) and history_floor_ok(
+            chat_id, date_ns, watch_policy, "watch"
         ):
             seen.add(rowid)
             count += 1
@@ -3125,9 +3189,10 @@ def action_inbox(params, conn, contacts, privacy_policy):
         else:
             cursor = saved
     # Nothing older than the oldest watch grant is ever eligible (see
-    # watch_floor_ok), so don't scan it either — even from cursor 0.
-    if policy.watch_since:
-        since_ns = max(since_ns, min(policy.watch_since.values()) - 1)
+    # history_floor_ok), so don't scan it either — even from cursor 0.
+    floors = list(policy.watch_since.values())
+    if floors and None not in floors:
+        since_ns = max(since_ns, min(floors) - 1)
 
     max_rowid = _max_message_rowid(conn)
     rows = (
@@ -3146,7 +3211,7 @@ def action_inbox(params, conn, contacts, privacy_policy):
         if (
             rowid in seen
             or not is_read_allowed(chat_id, sender, watch_policy)
-            or not watch_floor_ok(chat_id, sender, date_ns, watch_policy)
+            or not history_floor_ok(chat_id, date_ns, watch_policy, "watch")
         ):
             continue
         seen.add(rowid)

@@ -147,6 +147,18 @@ class FakeGate:
             self.approvals[aid]["payload"] = payload_override
 
 
+def add_carol_thread(conn, messages=((7, 10), (8, 3))):
+    """A 1:1 thread with Carol (chat rowid 5). messages: (rowid, days_ago) inbound."""
+    conn.execute("INSERT INTO chat VALUES (5, ?, '', 'iMessage', 45)", (CAROL,))
+    for rowid, days_ago in messages:
+        conn.execute(
+            "INSERT INTO message VALUES (?, ?, ?, NULL, 0, 2)",
+            (rowid, helper.to_apple_ns(time.time() - days_ago * 86400), f"carol 1:1 #{rowid}"),
+        )
+        conn.execute("INSERT INTO chat_message_join VALUES (5, ?)", (rowid,))
+    conn.commit()
+
+
 class GateModeTestCase(unittest.TestCase):
     """Installs a FakeGate as the helper's gate context and isolates state."""
 
@@ -588,12 +600,13 @@ class ReadScopeTests(GateModeTestCase):
         history = self.run_action("chat_history", {"chat": "Carol", "days": 30}, self.conn)
         self.assertEqual(history["count"], 0)
 
-    def test_review_needs_watch(self) -> None:
+    def test_review_needs_watch_and_skips_groups(self) -> None:
+        add_carol_thread(self.conn, messages=((7, 2),))
         result = self.run_action("review", {"days": 30}, self.conn)
         entries = [e for bucket in ("needs_reply", "low_priority") for e in result[bucket]]
-        self.assertTrue(entries)
-        self.assertTrue(all(e["is_group"] for e in entries))
-        self.assertNotIn(self.ref("4155551234"), [e["contact_ref"] for e in entries])
+        # Carol (watch) appears via her 1:1 thread only; Alice (read-only) and groups don't.
+        self.assertEqual([(e["name"], e["is_group"]) for e in entries], [("Carol Example", False)])
+        self.assertEqual(result["counts"]["total_messages"], 1)
 
     def test_contacts_lookup_reports_scopes(self) -> None:
         result = self.run_action("contacts_lookup", {"name": "Example"})
@@ -739,7 +752,13 @@ class GrantTests(GateModeTestCase):
         payload = self.gate.approvals[result["approval_id"]]["payload"]
         self.assertEqual(
             payload,
-            {"handle": CAROL, "display_name": "Carol Example", "scopes": ["read", "watch"], "duration_seconds": 604800},
+            {
+                "handle": CAROL,
+                "display_name": "Carol Example",
+                "scopes": ["read", "watch"],
+                "duration_seconds": 604800,
+                "lookback": "grant_time",
+            },
         )
         permanent = self.run_action(
             "request_grant", {"contact_ref": self.ref(BOB), "scopes": "send", "duration": "always"}
@@ -818,6 +837,7 @@ class WatchTests(GateModeTestCase):
         self.conn = sqlite3.connect(str(self.db))
         self.conn.text_factory = bytes
         self.addCleanup(self.conn.close)
+        add_carol_thread(self.conn)
 
     def add_message(self, rowid, handle_rowid, chat_rowid, text, is_from_me=0):
         self.conn.execute(
@@ -827,39 +847,39 @@ class WatchTests(GateModeTestCase):
         self.conn.execute("INSERT INTO chat_message_join VALUES (?, ?)", (chat_rowid, rowid))
         self.conn.commit()
 
-    def test_inbox_returns_only_watched_senders_masked(self) -> None:
+    def test_inbox_returns_only_watched_1to1_masked(self) -> None:
         result = self.run_action("inbox", {"cursor": 0}, self.conn)
-        # Carol sent rowids 3 (group) and 5 (group); Alice (read only) and Bob are excluded.
-        self.assertEqual([m["message_id"] for m in result["messages"]], [3, 5])
-        self.assertTrue(all(m["name"] == "Carol Example" for m in result["messages"]))
-        self.assertTrue(all(m["is_group"] for m in result["messages"]))
+        # Carol's 1:1 messages only; her group messages (rowids 3, 5) are not covered.
+        self.assertEqual([m["message_id"] for m in result["messages"]], [7, 8])
+        self.assertTrue(all(m["name"] == "Carol Example" and not m["is_group"] for m in result["messages"]))
         self.assertEqual(result["messages"][0]["contact_ref"], self.ref("4155559876"))
         blob = json.dumps(result)
         for raw in (CAROL, "4155559876", "chat100200300", ALICE, BOB):
             self.assertNotIn(raw, blob)
-        self.assertEqual(result["next_cursor"], 6)
+        self.assertEqual(result["next_cursor"], 8)
         self.assertFalse(result["has_more"])
 
     def test_inbox_saved_cursor_advances(self) -> None:
         first = self.run_action("inbox", {}, self.conn)  # first run: last 24h only
         self.assertEqual(first["messages"], [])
-        self.add_message(7, 2, 1, "hello from carol")
-        self.add_message(8, 1, 1, "hello from alice")
-        self.add_message(9, None, 1, "my reply", is_from_me=1)
+        self.add_message(20, 2, 5, "hello from carol")
+        self.add_message(21, 1, 1, "hello from alice")
+        self.add_message(22, 2, 2, "carol in the family group")
+        self.add_message(23, None, 5, "my reply", is_from_me=1)
         second = self.run_action("inbox", {}, self.conn)
         self.assertEqual([m["text"] for m in second["messages"]], ["hello from carol"])
-        self.assertEqual(second["next_cursor"], 9)
+        self.assertEqual(second["next_cursor"], 23)
         self.assertEqual(self.run_action("inbox", {}, self.conn)["messages"], [])
         # An explicit cursor reads without moving the saved one.
-        replay = self.run_action("inbox", {"cursor": 6}, self.conn)
+        replay = self.run_action("inbox", {"cursor": 8}, self.conn)
         self.assertEqual(len(replay["messages"]), 1)
-        self.assertEqual(helper._load_watch_state()["inbox_cursor"], 9)
+        self.assertEqual(helper._load_watch_state()["inbox_cursor"], 23)
 
     def test_inbox_limit_and_has_more(self) -> None:
         result = self.run_action("inbox", {"cursor": 0, "limit": 1}, self.conn)
-        self.assertEqual([m["message_id"] for m in result["messages"]], [3])
+        self.assertEqual([m["message_id"] for m in result["messages"]], [7])
         self.assertTrue(result["has_more"])
-        self.assertEqual(result["next_cursor"], 3)
+        self.assertEqual(result["next_cursor"], 7)
         for bad in (0, 1000, "x"):
             with self.subTest(limit=bad), self.assertRaises(ValueError):
                 self.run_action("inbox", {"cursor": 0, "limit": bad}, self.conn)
@@ -867,27 +887,27 @@ class WatchTests(GateModeTestCase):
             self.run_action("inbox", {"cursor": -1}, self.conn)
 
     def test_inbox_redacts(self) -> None:
-        self.add_message(7, 2, 1, "your code is 123456 verification code")
-        result = self.run_action("inbox", {"cursor": 6}, self.conn)
+        self.add_message(20, 2, 5, "your code is 123456 verification code")
+        result = self.run_action("inbox", {"cursor": 8}, self.conn)
         self.assertNotIn("123456", json.dumps(result))
 
     def test_watch_tick_counts_without_content(self) -> None:
         first = self.run_action("watch_tick", {}, self.conn)
         self.assertEqual(first, {"new_count": 0, "initialized": True, "capped": False})
-        self.add_message(7, 2, 1, "carol 1")
-        self.add_message(8, 2, 2, "carol 2 in group")
-        self.add_message(9, 1, 1, "alice (read only)")
-        self.add_message(10, 3, 2, "bob")
-        self.add_message(11, None, 1, "me", is_from_me=1)
+        self.add_message(20, 2, 5, "carol 1")
+        self.add_message(21, 2, 2, "carol 2 in group")
+        self.add_message(22, 1, 1, "alice (read only)")
+        self.add_message(23, 3, 2, "bob")
+        self.add_message(24, None, 5, "me", is_from_me=1)
         tick = self.run_action("watch_tick", {}, self.conn)
-        self.assertEqual(tick, {"new_count": 2, "initialized": False, "capped": False})
+        self.assertEqual(tick, {"new_count": 1, "initialized": False, "capped": False})
         self.assertNotIn(TEXT_SENTINEL, json.dumps(tick))
         self.assertEqual(self.run_action("watch_tick", {}, self.conn)["new_count"], 0)
 
     def test_watch_tick_after_revoke_counts_nothing(self) -> None:
         self.run_action("watch_tick", {}, self.conn)
         self.gate.grants = [grant(22, ALICE, "read")]
-        self.add_message(7, 2, 1, "carol after revoke")
+        self.add_message(20, 2, 5, "carol after revoke")
         self.assertEqual(self.run_action("watch_tick", {}, self.conn)["new_count"], 0)
 
     def test_watch_state_tampering_resets_safely(self) -> None:
@@ -995,14 +1015,10 @@ class NoRawIdentifierTests(GateModeTestCase):
             with self.subTest(action=name):
                 self.assert_clean(result)
         self.assertTrue(results["search"]["matches"])
-        group = results["history_group"]
-        self.assertEqual(group["count"], 1)
-        self.assertEqual(group["messages"][0]["name"], "Carol, Unknown")
-        self.assertEqual(group["messages"][0]["sender"]["name"], "Carol Example")
+        # Per-contact grants never cover group threads.
+        self.assertEqual(results["history_group"]["count"], 0)
+        self.assertFalse(any(m["is_group"] for m in results["search"]["matches"]))
         self.assertEqual(results["history_ref"]["resolved"]["contact_ref"], self.ref("4155551234"))
-        unknown = [m for m in results["search"]["matches"] if m.get("sender", {}).get("contact_ref") == self.ref(BOB)]
-        self.assertTrue(unknown)
-        self.assertTrue(all(m["sender"]["name"] == "" for m in unknown))
 
     def test_local_mode_responses_have_no_raw_identifiers(self) -> None:
         saved = helper._GATE_CONTEXT
@@ -1123,14 +1139,16 @@ class WatchFloorTests(GateModeTestCase):
         self.addCleanup(self.conn.close)
 
     def test_inbox_cursor_zero_does_not_read_history(self) -> None:
+        add_carol_thread(self.conn)
         self.assertEqual(self.run_action("inbox", {"cursor": 0}, self.conn)["messages"], [])
-        self.conn.execute("INSERT INTO message VALUES (7, ?, 'fresh', NULL, 0, 2)", (helper.to_apple_ns(time.time()),))
-        self.conn.execute("INSERT INTO chat_message_join VALUES (1, 7)")
+        self.conn.execute("INSERT INTO message VALUES (9, ?, 'fresh', NULL, 0, 2)", (helper.to_apple_ns(time.time()),))
+        self.conn.execute("INSERT INTO chat_message_join VALUES (5, 9)")
         self.conn.commit()
         result = self.run_action("inbox", {"cursor": 0}, self.conn)
         self.assertEqual([m["text"] for m in result["messages"]], ["fresh"])
 
     def test_review_does_not_read_history(self) -> None:
+        add_carol_thread(self.conn)
         result = self.run_action("review", {"days": 90}, self.conn)
         self.assertEqual(result["counts"]["total_messages"], 0)
 
@@ -1153,6 +1171,128 @@ class PolicyFreshnessTests(GateModeTestCase):
         with self.assertRaisesRegex(RuntimeError, "approval gate unavailable"):
             helper.action_send({"to": ALICE, "text": "hi"}, None, CONTACTS, stale)
         self.assertEqual(self.scripts, [])
+
+
+def iso_ago(days: float) -> str:
+    return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+
+class ReadFloorTests(GateModeTestCase):
+    """Each read grant carries a history floor (lookback); reads never go below it."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._tmp = tempfile.TemporaryDirectory(prefix="gate-read-floor-")
+        self.addCleanup(self._tmp.cleanup)
+        db = Path(self._tmp.name) / "chat.db"
+        build_fixture_db(db)
+        self.conn = sqlite3.connect(str(db))
+        self.conn.text_factory = bytes
+        self.addCleanup(self.conn.close)
+        add_carol_thread(self.conn, messages=((7, 40), (8, 20), (9, 5), (10, 0.01)))
+
+    def history(self, **grant_fields):
+        self.gate.grants = [grant(1, CAROL, "read", **grant_fields)]
+        result = self.run_action("chat_history", {"contact_ref": self.ref("4155559876"), "days": 90}, self.conn)
+        return [m["text"] for m in result["messages"]]
+
+    def test_grant_time_floor_is_default(self) -> None:
+        created = iso_ago(1)
+        # An older gate sends no lookback fields: the floor is the grant's creation.
+        self.assertEqual(self.history(created_at=created), ["carol 1:1 #10"])
+        self.gate.grants = [
+            dict(grant(1, CAROL, "read", created_at=created), lookback="grant_time", history_floor_at=created)
+        ]
+        result = self.run_action("chat_history", {"contact_ref": self.ref("4155559876"), "days": 90}, self.conn)
+        self.assertEqual([m["text"] for m in result["messages"]], ["carol 1:1 #10"])
+
+    def _with_lookback(self, lookback, floor_days):
+        g = dict(grant(1, CAROL, "read", created_at=iso_ago(0.001)), lookback=lookback)
+        g["history_floor_at"] = None if floor_days is None else iso_ago(floor_days)
+        self.gate.grants = [g]
+
+    def test_lookback_7d_30d_all(self) -> None:
+        for lookback, floor_days, expected in (
+            ("7d", 7, ["carol 1:1 #9", "carol 1:1 #10"]),
+            ("30d", 30, ["carol 1:1 #8", "carol 1:1 #9", "carol 1:1 #10"]),
+            ("all", None, ["carol 1:1 #7", "carol 1:1 #8", "carol 1:1 #9", "carol 1:1 #10"]),
+        ):
+            with self.subTest(lookback=lookback):
+                self._with_lookback(lookback, floor_days)
+                ref = self.ref("4155559876")
+                history = self.run_action("chat_history", {"contact_ref": ref, "days": 90}, self.conn)
+                self.assertEqual([m["text"] for m in history["messages"]], expected)
+                search = self.run_action("search", {"term": "carol 1:1", "days": 90}, self.conn)
+                self.assertEqual(sorted(m["text"] for m in search["matches"]), sorted(expected))
+                stats = self.run_action("response_stats", {"contact_ref": ref, "hours": 720}, self.conn)
+                self.assertEqual(stats["total_inbound_messages"], len([e for e in expected if e != "carol 1:1 #7"]))
+
+    def test_read_grant_excludes_group_threads(self) -> None:
+        self._with_lookback("all", None)
+        search = self.run_action("search", {"term": "SENTINEL", "days": 90}, self.conn)
+        self.assertEqual(search["matches"], [])  # Carol's group messages (3, 5) aren't covered
+        group = self.run_action(
+            "chat_history", {"thread_ref": helper.thread_ref("chat100200300"), "days": 90}, self.conn
+        )
+        self.assertEqual(group["count"], 0)
+
+    def test_most_generous_grant_wins(self) -> None:
+        narrow = dict(grant(1, CAROL, "read", created_at=iso_ago(0.001)), lookback="grant_time", history_floor_at=iso_ago(0.001))
+        wide = dict(grant(2, CAROL, "read", created_at=iso_ago(0.001)), lookback="all", history_floor_at=None)
+        self.gate.grants = [narrow, wide]
+        history = self.run_action("chat_history", {"contact_ref": self.ref("4155559876"), "days": 90}, self.conn)
+        self.assertEqual(history["count"], 4)
+
+    def test_malformed_lookback_drops_grant(self) -> None:
+        self.gate.grants = [dict(grant(1, CAROL, "read"), lookback="forever")]
+        self.assertEqual(self.policy().read, ())
+
+    def test_list_grants_shows_lookback(self) -> None:
+        self._with_lookback("7d", 7)
+        [g] = self.run_action("list_grants", {})["grants"]
+        self.assertEqual(g["lookback"], "7d")
+        self.assertTrue(g["history_from"])
+
+
+class GrantPresetRequestTests(GateModeTestCase):
+    def payload(self, params):
+        result = self.run_action("request_grant", {"contact_ref": self.ref("4155559876"), **params})
+        return result, self.gate.approvals[result["approval_id"]]["payload"]
+
+    def test_trusted_preset(self) -> None:
+        result, payload = self.payload({"preset": "trusted"})
+        self.assertEqual(payload["scopes"], ["read", "send"])
+        self.assertIsNone(payload["duration_seconds"])
+        self.assertEqual(payload["lookback"], "all")
+        _, payload = self.payload({"preset": "trusted", "lookback": "30d", "scopes": ["watch"]})
+        self.assertEqual((payload["scopes"], payload["lookback"]), (["read", "send", "watch"], "30d"))
+
+    def test_standard_preset(self) -> None:
+        _, payload = self.payload({"preset": "standard"})
+        self.assertEqual((payload["scopes"], payload["duration_seconds"]), (["send"], 86400))
+        self.assertNotIn("lookback", payload)
+        _, payload = self.payload({"preset": "standard", "duration": "1w"})
+        self.assertEqual(payload["duration_seconds"], 604800)
+
+    def test_explicit_read_defaults_to_grant_time(self) -> None:
+        _, payload = self.payload({"scopes": ["read"], "duration": "1d"})
+        self.assertEqual(payload["lookback"], "grant_time")
+        _, payload = self.payload({"scopes": ["read"], "duration": "1d", "lookback": "7d"})
+        self.assertEqual(payload["lookback"], "7d")
+        _, payload = self.payload({"scopes": ["send"], "duration": "1d"})
+        self.assertNotIn("lookback", payload)
+
+    def test_invalid_combinations(self) -> None:
+        ref = self.ref("4155559876")
+        for params in (
+            {"preset": "vip"},
+            {"preset": "standard", "duration": "1m"},
+            {"preset": "standard", "lookback": "all"},
+            {"preset": "trusted", "lookback": "90d"},
+            {"scopes": ["send"], "duration": "1d", "lookback": "7d"},
+        ):
+            with self.subTest(params=params), self.assertRaises(ValueError):
+                self.run_action("request_grant", {"contact_ref": ref, **params})
 
 
 class GateJsonFailClosedTests(unittest.TestCase):
