@@ -589,6 +589,11 @@ allowlist:
   denies on their phone with a passkey. The helper can request approvals,
   consume approved sends, list and revoke grants, and write audit entries. It
   cannot approve anything or create a grant.
+- A grant covers only the **1:1 thread** with that exact handle (E.164 or lowercased email).
+  Group threads are never covered, even for messages the contact sent there.
+- `read` and `watch` grants carry a **history floor** (`lookback`): `grant_time` (the
+  default, only messages from the grant on), `7d`, `30d`, or `all`. The approver sets it on
+  the phone. Every read and watch action drops messages older than the floor.
 - The local `blocked_chats.txt` still wins over every grant.
 - **Fail closed:** if the gate is unreachable, rejects the token, or `gate.json`
   names a gate incompletely, reads return nothing, sends and gate actions
@@ -643,8 +648,12 @@ creates no approval.
 
 `scopes` is any non-empty subset of `send`, `read`, `watch`. `duration` is
 required: `"30m"`, `"12h"`, `"1d"`, `"1w"`, a number of seconds (minimum 60,
-maximum a year), or `"always"`. Returns `pending_approval` with `approve_url`,
-like `send`.
+maximum a year), or `"always"`. For `read`/`watch`, `lookback` is one of
+`grant_time` (default), `7d`, `30d`, or `all`. Presets replace `scopes`/`duration`:
+`{"preset": "trusted"}` (permanent send + read, lookback default `all`; add
+`"scopes": ["watch"]` to include watch) and `{"preset": "standard", "duration": "1d"|"1w"}`
+(send only). The approver can choose a different preset or lookback. Returns
+`pending_approval` with `approve_url`, like `send`.
 
 ### `approval_status`
 
@@ -654,7 +663,7 @@ plus `grants` (`grant_id`, `scope`, `expires_at`) once a grant request is approv
 ### `list_grants` / `revoke_grant`
 
 `list_grants` returns the active grants as
-`{"grant_id", "scope", "expires_at", "name", "label", "service", "contact_ref"}`.
+`{"grant_id", "scope", "expires_at", "lookback", "history_from", "name", "label", "service", "contact_ref"}`.
 `revoke_grant` takes `{"grant_id"}` or `{"contact_ref", "scope"?}` (every
 active grant for that contact, optionally one scope). It needs no approval.
 
