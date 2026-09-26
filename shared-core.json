@@ -19,7 +19,7 @@
       "logical_name": "helper.py",
       "path": "bin/helper.py",
       "normalization": "identity",
-      "sha256": "a8ad42b37c450135eeb2dabd3ceb8f5a141b28659983205d5c0ff8e8ecb45d90"
+      "sha256": "dfa32bf8f4bd327efc2db391fd95e82fdb73b5aa6720797bb26256a5de9c623c"
     },
     {
       "logical_name": "contact_refs.py",

@@ -24,6 +24,7 @@ import time
 import unittest
 import uuid
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -48,16 +49,27 @@ BOB = "bob@example.com"
 CONTACTS = {"4155551234": "Alice Example", "4155559876": "Carol Example", BOB: "Bob Example"}
 
 
-def grant(gid: int, handle: str, scope: str, expires_at: str | None = None) -> dict:
+NAMES = {ALICE: "Alice Example", CAROL: "Carol Example", BOB: "Bob Example"}
+LONG_AGO = "2000-01-01T00:00:00+00:00"
+
+
+def grant(
+    gid: int,
+    handle: str,
+    scope: str,
+    expires_at: str | None = None,
+    created_at: str = LONG_AGO,
+    display_name: str | None = None,
+) -> dict:
     return {
         "id": gid,
         "handle": handle,
-        "display_name": "x",
+        "display_name": display_name if display_name is not None else NAMES.get(handle, "Unknown contact"),
         "scope": scope,
         "expires_at": expires_at,
         "revoked_at": None,
         "approval_id": None,
-        "created_at": "2026-09-25T00:00:00+00:00",
+        "created_at": created_at,
     }
 
 
@@ -193,7 +205,7 @@ class GateModeTestCase(unittest.TestCase):
         return 0, "", ""
 
     def policy(self):
-        return helper.load_gate_policy(helper._GATE_CONTEXT)
+        return helper.load_gate_policy(helper._GATE_CONTEXT, CONTACTS)
 
     def ref(self, key: str) -> str:
         return helper._contact_refs.make_contact_ref(key)
@@ -545,7 +557,7 @@ class PolicyMappingTests(GateModeTestCase):
         policy = self.policy()
         self.assertEqual(policy.allowlist, ())
         self.assertEqual(policy.send, ())
-        self.assertIn("timed out", policy.gate_error)
+        self.assertEqual(policy.gate_error, "approval gate unavailable")
         self.assertFalse(helper.is_read_allowed(ALICE, ALICE, policy))
         with self.assertRaisesRegex(RuntimeError, "gate unavailable"):
             helper.action_send({"to": ALICE, "text": "hi"}, None, CONTACTS, policy)
@@ -572,16 +584,16 @@ class ReadScopeTests(GateModeTestCase):
 
     def test_search_and_history_need_read(self) -> None:
         result = self.run_action("search", {"term": "SENTINEL", "days": 30}, self.conn)
-        self.assertEqual({m["chat_id"] for m in result["matches"]}, {ALICE})
+        self.assertEqual({m["contact_ref"] for m in result["matches"]}, {self.ref("4155551234")})
         history = self.run_action("chat_history", {"chat": "Carol", "days": 30}, self.conn)
         self.assertEqual(history["count"], 0)
 
     def test_review_needs_watch(self) -> None:
         result = self.run_action("review", {"days": 30}, self.conn)
-        chats = {e["chat_id"] for bucket in ("needs_reply", "low_priority") for e in result[bucket]}
-        self.assertNotIn(ALICE, chats)
-        self.assertTrue(chats)
-        self.assertTrue(all(c.startswith("chat") for c in chats))
+        entries = [e for bucket in ("needs_reply", "low_priority") for e in result[bucket]]
+        self.assertTrue(entries)
+        self.assertTrue(all(e["is_group"] for e in entries))
+        self.assertNotIn(self.ref("4155551234"), [e["contact_ref"] for e in entries])
 
     def test_contacts_lookup_reports_scopes(self) -> None:
         result = self.run_action("contacts_lookup", {"name": "Example"})
@@ -925,6 +937,294 @@ class StatusTests(GateModeTestCase):
         self.assertEqual(status["read_policy"]["source"], "gate")
         self.assertEqual(status["protocol_version"], "1.3")
         self.assertNotIn(TOKEN, json.dumps(status))
+
+
+# ---------------------------------------------------------------------------
+# Security review (PR #4) regressions
+# ---------------------------------------------------------------------------
+RAW_IDENTIFIERS = (
+    "+1415", "4155551234", "4155559876", "4155550000", "bob@example.com",
+    "chat100200300", "chat400500600", "\u2026",
+)
+
+
+class NoRawIdentifierTests(GateModeTestCase):
+    """Agent-facing read responses carry names, labels, and refs only."""
+
+    # Bob isn't in this fixture's contacts, so his honest grants say "Unknown contact".
+    grants = [grant(1, ALICE, "read"), grant(2, CAROL, "read"), grant(3, BOB, "read", display_name="Unknown contact"),
+              grant(4, ALICE, "watch"), grant(5, CAROL, "watch"), grant(6, BOB, "watch", display_name="Unknown contact")]
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._tmp = tempfile.TemporaryDirectory(prefix="gate-raw-")
+        self.addCleanup(self._tmp.cleanup)
+        db = Path(self._tmp.name) / "chat.db"
+        build_fixture_db(db)
+        self.conn = sqlite3.connect(str(db))
+        self.conn.text_factory = bytes
+        self.addCleanup(self.conn.close)
+        self.contacts = {"4155551234": "Alice Example", "4155559876": "Carol Example"}
+
+    def policy(self):
+        return helper.load_gate_policy(helper._GATE_CONTEXT, self.contacts)
+
+    def assert_clean(self, result) -> None:
+        blob = json.dumps(result, ensure_ascii=False)
+        for raw in RAW_IDENTIFIERS:
+            self.assertNotIn(raw, blob)
+
+    def responses(self, policy):
+        conn, c = self.conn, self.contacts
+        group_ref = helper.thread_ref("chat400500600")
+        return {
+            "review": helper.action_review({"days": 30}, conn, c, policy),
+            "search": helper.action_search({"term": "SENTINEL", "days": 90}, conn, c, policy),
+            "history_name": helper.action_chat_history({"chat": "Alice", "days": 30}, conn, c, policy),
+            "history_ref": helper.action_chat_history(
+                {"contact_ref": self.ref("4155551234"), "days": 30}, conn, c, policy
+            ),
+            "history_group": helper.action_chat_history({"thread_ref": group_ref, "days": 30}, conn, c, policy),
+            "stats": helper.action_response_stats({"contact_ref": self.ref("4155551234"), "hours": 48}, conn, c, policy),
+            "inbox": helper.action_inbox({"cursor": 0}, conn, c, policy),
+        }
+
+    def test_gate_mode_responses_have_no_raw_identifiers(self) -> None:
+        results = self.responses(self.policy())
+        for name, result in results.items():
+            with self.subTest(action=name):
+                self.assert_clean(result)
+        self.assertTrue(results["search"]["matches"])
+        group = results["history_group"]
+        self.assertEqual(group["count"], 1)
+        self.assertEqual(group["messages"][0]["name"], "Carol, Unknown")
+        self.assertEqual(group["messages"][0]["sender"]["name"], "Carol Example")
+        self.assertEqual(results["history_ref"]["resolved"]["contact_ref"], self.ref("4155551234"))
+        unknown = [m for m in results["search"]["matches"] if m.get("sender", {}).get("contact_ref") == self.ref(BOB)]
+        self.assertTrue(unknown)
+        self.assertTrue(all(m["sender"]["name"] == "" for m in unknown))
+
+    def test_local_mode_responses_have_no_raw_identifiers(self) -> None:
+        saved = helper._GATE_CONTEXT
+        helper._GATE_CONTEXT = helper.GateContext()
+        self.addCleanup(setattr, helper, "_GATE_CONTEXT", saved)
+        local = helper.PrivacyPolicy(mode="blocklist", blocklist=(), allowlist=())
+        conn, c = self.conn, self.contacts
+        for result in (
+            helper.action_review({"days": 30}, conn, c, local),
+            helper.action_search({"term": "SENTINEL", "days": 90}, conn, c, local),
+            helper.action_chat_history({"chat": "Carol", "days": 30}, conn, c, local),
+            helper.action_response_stats({"chat": "Alice", "hours": 48}, conn, c, local),
+        ):
+            self.assert_clean(result)
+
+    def test_read_target_validation(self) -> None:
+        for params in ({}, {"chat": "x", "contact_ref": "y"}, {"thread_ref": "zz"}):
+            with self.subTest(params=params), self.assertRaises(ValueError):
+                helper.action_chat_history(params, self.conn, self.contacts, self.policy())
+
+
+class ExactGrantMatchTests(GateModeTestCase):
+    """C1: a grant for +14155551234 must not cover look-alike handles."""
+
+    grants = [grant(1, ALICE, "send"), grant(2, ALICE, "read"), grant(3, ALICE, "watch")]
+
+    def test_send_grant_does_not_cover_lookalikes(self) -> None:
+        for to in ("4155551234@attacker.example", "+444155551234", "+1 (415) 555-1234 ext"):
+            with self.subTest(to=to):
+                try:
+                    result = self.run_action("send", {"to": to, "text": "hi"})
+                except ValueError:
+                    continue
+                self.assertEqual(result["status"], "pending_approval")
+        self.assertEqual(self.scripts, [])
+        # The real handle still auto-sends.
+        self.assertEqual(self.run_action("send", {"to": "(415) 555-1234", "text": "hi"})["status"], "sent")
+
+    def test_read_and_watch_grants_are_exact(self) -> None:
+        policy = self.policy()
+        self.assertTrue(helper.is_read_allowed(ALICE, ALICE, policy))
+        for lookalike in ("4155551234@attacker.example", "+444155551234", "chat4155551234"):
+            with self.subTest(lookalike=lookalike):
+                self.assertFalse(helper.is_read_allowed(lookalike, lookalike, policy))
+                self.assertFalse(
+                    helper.is_read_allowed(lookalike, lookalike, helper.scoped_policy(policy, "watch"))
+                )
+
+    def test_blocklist_keeps_last10_matching(self) -> None:
+        self.blocklist.write_text("4155551234\n")
+        policy = self.policy()
+        self.assertTrue(helper.is_blocked("+14155551234", "", policy))
+        # Broad last-10 matching is intentional here: over-blocking fails safe.
+        self.assertTrue(helper.is_blocked("4155551234@attacker.example", "", policy))
+        self.assertFalse(helper.is_read_allowed(ALICE, ALICE, policy))
+
+
+class DisplayNameTests(GateModeTestCase):
+    """H2: approvals and grants must carry the name the helper would have used."""
+
+    grants = [
+        grant(1, BOB, "send", display_name="Mom"),                  # spoofed name on a known contact
+        grant(2, "+15555550100", "send", display_name="Mom"),      # spoofed name, unknown number
+        grant(3, "+15555550101", "send"),                           # honest unknown number
+        grant(4, ALICE, "send", display_name="Alice Example "),    # not exactly what the helper writes
+    ]
+
+    def test_grants_with_wrong_names_are_dropped(self) -> None:
+        self.assertEqual(self.policy().send, ("+15555550101",))
+
+    def _approve(self, payload):
+        aid = str(uuid.uuid4())
+        self.gate.approvals[aid] = {"kind": "send", "payload": payload, "status": "approved"}
+        return aid
+
+    def test_commit_refuses_spoofed_name(self) -> None:
+        aid = self._approve({"handle": CAROL, "display_name": "Mom", "service": "iMessage", "text": "hi"})
+        with self.assertRaisesRegex(ValueError, "does not match your contacts"):
+            self.run_action("send_commit", {"approval_id": aid})
+        self.assertEqual(self.scripts, [])
+        self.assertEqual(self.gate.audits[-1][0], "send_refused")
+
+    def test_commit_refuses_name_on_unknown_number(self) -> None:
+        aid = self._approve({"handle": "+15555550100", "display_name": "Mom", "service": "iMessage", "text": "hi"})
+        with self.assertRaises(ValueError):
+            self.run_action("send_commit", {"approval_id": aid})
+        self.assertEqual(self.scripts, [])
+
+    def test_commit_allows_honest_payloads(self) -> None:
+        for payload in (
+            {"handle": CAROL, "display_name": "Carol Example", "service": "iMessage", "text": "a"},
+            {"handle": "+15555550100", "display_name": "Unknown contact", "service": "iMessage", "text": "b"},
+        ):
+            self.run_action("send_commit", {"approval_id": self._approve(payload)})
+        self.assertEqual(len(self.scripts), 2)
+
+    def test_helper_writes_sanitized_names(self) -> None:
+        contacts = {**CONTACTS, "4155559876": "\u202eCarol\u200b Example "}
+        result = helper.action_send(
+            {"contact_ref": self.ref("4155559876"), "text": "hi"}, None, contacts, self.policy()
+        )
+        self.assertEqual(self.gate.approvals[result["approval_id"]]["payload"]["display_name"], "Carol Example")
+
+
+class WatchFloorTests(GateModeTestCase):
+    """M2: watch never reaches back before the watch grant existed."""
+
+    def setUp(self) -> None:
+        now = datetime.now(timezone.utc) - timedelta(seconds=5)
+        self.grants = [grant(1, CAROL, "watch", created_at=now.isoformat())]
+        super().setUp()
+        self._tmp = tempfile.TemporaryDirectory(prefix="gate-floor-")
+        self.addCleanup(self._tmp.cleanup)
+        db = Path(self._tmp.name) / "chat.db"
+        build_fixture_db(db)
+        self.conn = sqlite3.connect(str(db))
+        self.conn.text_factory = bytes
+        self.addCleanup(self.conn.close)
+
+    def test_inbox_cursor_zero_does_not_read_history(self) -> None:
+        self.assertEqual(self.run_action("inbox", {"cursor": 0}, self.conn)["messages"], [])
+        self.conn.execute("INSERT INTO message VALUES (7, ?, 'fresh', NULL, 0, 2)", (helper.to_apple_ns(time.time()),))
+        self.conn.execute("INSERT INTO chat_message_join VALUES (1, 7)")
+        self.conn.commit()
+        result = self.run_action("inbox", {"cursor": 0}, self.conn)
+        self.assertEqual([m["text"] for m in result["messages"]], ["fresh"])
+
+    def test_review_does_not_read_history(self) -> None:
+        result = self.run_action("review", {"days": 90}, self.conn)
+        self.assertEqual(result["counts"]["total_messages"], 0)
+
+
+class PolicyFreshnessTests(GateModeTestCase):
+    """M3: a revoke takes effect for a send already in flight."""
+
+    grants = [grant(1, ALICE, "send")]
+
+    def test_revoked_between_load_and_send(self) -> None:
+        stale = self.policy()
+        self.gate.grants = []
+        result = helper.action_send({"to": ALICE, "text": "hi"}, None, CONTACTS, stale)
+        self.assertEqual(result["status"], "pending_approval")
+        self.assertEqual(self.scripts, [])
+
+    def test_gate_down_at_send_time_does_not_send(self) -> None:
+        stale = self.policy()
+        self.gate.fail = gate_client.GateUnavailable("down")
+        with self.assertRaisesRegex(RuntimeError, "approval gate unavailable"):
+            helper.action_send({"to": ALICE, "text": "hi"}, None, CONTACTS, stale)
+        self.assertEqual(self.scripts, [])
+
+
+class GateJsonFailClosedTests(unittest.TestCase):
+    """M1: a gate.json that exists but can't be trusted never means legacy mode."""
+
+    def _ctx(self, content: str | None, mode: int = 0o600):
+        with tempfile.TemporaryDirectory(prefix="gate-json-m1-") as td:
+            path = Path(td) / "gate.json"
+            if content is not None:
+                path.write_text(content)
+                path.chmod(mode)
+            with mock.patch.dict(os.environ, {"IMESSAGE_GATE_PATH": str(path)}):
+                return helper._build_gate_context()
+
+    def test_invalid_json_fails_closed(self) -> None:
+        ctx = self._ctx("{not json")
+        self.assertTrue(ctx.enabled)
+        self.assertIsNone(ctx.client)
+
+    def test_unsafe_permissions_fail_closed(self) -> None:
+        ctx = self._ctx(json.dumps({"contact_ref_hmac_key": "k"}), mode=0o666)
+        self.assertTrue(ctx.enabled)
+        self.assertIsNone(ctx.client)
+
+    def test_missing_file_is_legacy(self) -> None:
+        self.assertFalse(self._ctx(None).enabled)
+
+
+class ErrorScrubTests(GateModeTestCase):
+    """M5: raw handles never reach the agent through error text."""
+
+    def test_gate_422_detail_is_not_echoed(self) -> None:
+        self.gate.create_approval = mock.Mock(
+            side_effect=gate_client.GateError(422, [{"input": {"handle": CAROL}, "msg": "bad"}])
+        )
+        with self.assertRaises(ValueError) as caught:
+            self.run_action("send", {"contact_ref": self.ref("4155559876"), "text": "x"})
+        self.assertNotIn("4155559876", str(caught.exception))
+
+    def test_osascript_error_is_not_echoed(self) -> None:
+        self.gate.grants = [grant(1, ALICE, "send")]
+        with mock.patch.object(helper, "_run_osascript", return_value=(1, "", f'Can\u2019t get buddy "{ALICE}".')):
+            with self.assertRaises(RuntimeError) as caught:
+                self.run_action("send", {"contact_ref": self.ref("4155551234"), "text": "x"})
+        self.assertNotIn("4155551234", str(caught.exception))
+
+    def test_scrub_handles(self) -> None:
+        self.assertEqual(helper.scrub_handles(f"buddy {ALICE} or a@b.co"), "buddy [redacted] or [redacted]")
+        for keep in ("2026-09-25T12:00:00", "request exceeds 65536 byte limit", "rc=1"):
+            self.assertEqual(helper.scrub_handles(keep), keep)
+
+    def test_process_request_scrubs_errors(self) -> None:
+        for directory in (helper.REQUESTS_DIR.parent, helper.REQUESTS_DIR, helper.RESPONSES_DIR):
+            directory.mkdir(mode=0o700, exist_ok=True)
+        req = helper.REQUESTS_DIR / "request-scrub.json"
+        req.write_text(json.dumps({"id": "s", "action": "send", "params": {"to": "chat" + ALICE, "text": "x"}}))
+        helper.process_request(req, self.policy())
+        response = json.loads((helper.RESPONSES_DIR / "response-scrub.json").read_text())
+        self.assertFalse(response["ok"])
+        self.assertNotIn("4155551234", response["error"])
+
+
+class TextValidationTests(unittest.TestCase):
+    """L3: invisible/bidi controls can't disguise what the phone shows."""
+
+    def test_bidi_and_zero_width_rejected(self) -> None:
+        for ch in ("\u202e", "\u2066", "\u200b", "\ufeff"):
+            with self.subTest(ch=hex(ord(ch))), self.assertRaises(ValueError):
+                helper.validate_send_text(f"pay {ch}me")
+
+    def test_emoji_zwj_allowed(self) -> None:
+        self.assertEqual(helper.validate_send_text("\U0001f468\u200d\U0001f469\u200d\U0001f467"), "\U0001f468\u200d\U0001f469\u200d\U0001f467")
 
 
 # ---------------------------------------------------------------------------
