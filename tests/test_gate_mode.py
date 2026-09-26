@@ -81,6 +81,7 @@ class FakeGate:
         self.revoked: list[int] = []
         self.calls: list[str] = []
         self.fail: Exception | None = None
+        self.unknown_senders: dict | None = None
         self.config = gate_client.GateConfig("https://gate.test", TOKEN)
 
     def _enter(self, name):
@@ -90,7 +91,10 @@ class FakeGate:
 
     def policy(self):
         self._enter("policy")
-        return {"generated_at": "2026-09-25T00:00:00+00:00", "grants": list(self.grants)}
+        out = {"generated_at": "2026-09-25T00:00:00+00:00", "grants": list(self.grants)}
+        if self.unknown_senders is not None:
+            out["unknown_senders"] = self.unknown_senders
+        return out
 
     def create_approval(self, kind, payload):
         self._enter("create_approval")
@@ -181,6 +185,7 @@ class GateModeTestCase(unittest.TestCase):
             ("RESPONSES_DIR", bridge / "control" / "responses"),
             ("LOG_PATH", bridge / "control" / "log.txt"),
             ("WATCH_STATE_PATH", bridge / "state" / "watch.json"),
+            ("GROK_ADDED_PATH", bridge / "state" / "grok_added.json"),
         ):
             patcher = mock.patch.object(helper, name, value)
             patcher.start()
@@ -645,7 +650,13 @@ class SendTests(GateModeTestCase):
         self.assertEqual(stored["kind"], "send")
         self.assertEqual(
             stored["payload"],
-            {"handle": CAROL, "display_name": "Carol Example", "service": "SMS", "text": "hi Carol"},
+            {
+                "handle": CAROL,
+                "display_name": "Carol Example",
+                "service": "SMS",
+                "text": "hi Carol",
+                "contact_origin": "contacts",
+            },
         )
         self.assertTrue(result["approve_url"].endswith(result["approval_id"]))
         self.assertEqual(result["recipient"]["contact_ref"], self.ref("4155559876"))
@@ -758,6 +769,7 @@ class GrantTests(GateModeTestCase):
                 "scopes": ["read", "watch"],
                 "duration_seconds": 604800,
                 "lookback": "grant_time",
+                "contact_origin": "contacts",
             },
         )
         permanent = self.run_action(
@@ -1293,6 +1305,172 @@ class GrantPresetRequestTests(GateModeTestCase):
         ):
             with self.subTest(params=params), self.assertRaises(ValueError):
                 self.run_action("request_grant", {"contact_ref": ref, **params})
+
+
+STRANGER = "+15557771234"
+
+
+class UnknownSenderTests(GateModeTestCase):
+    """Standing unknown-senders setting, thread_ref replies, and save_contact."""
+
+    grants = [grant(1, ALICE, "send")]
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._tmp = tempfile.TemporaryDirectory(prefix="gate-unknown-")
+        self.addCleanup(self._tmp.cleanup)
+        self.db = Path(self._tmp.name) / "chat.db"
+        build_fixture_db(self.db)
+        conn = sqlite3.connect(str(self.db))
+        conn.execute("INSERT INTO handle VALUES (5, ?)", (STRANGER,))
+        conn.execute("INSERT INTO chat VALUES (6, ?, '', 'iMessage', 45)", (STRANGER,))
+        for rowid, days_ago, chat in ((30, 10, 6), (31, 1, 6), (32, 0.5, 2)):
+            conn.execute(
+                "INSERT INTO message VALUES (?, ?, ?, NULL, 0, 5)",
+                (rowid, helper.to_apple_ns(time.time() - days_ago * 86400), f"stranger #{rowid}"),
+            )
+            conn.execute("INSERT INTO chat_message_join VALUES (?, ?)", (chat, rowid))
+        conn.commit()
+        conn.close()
+        self.conn = sqlite3.connect(str(self.db))
+        self.conn.text_factory = bytes
+        self.addCleanup(self.conn.close)
+        patcher = mock.patch.object(helper, "open_chatdb_direct", side_effect=self._direct)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.gate.unknown_senders = {"enabled": True, "lookback": "7d", "floor_at": iso_ago(7)}
+        self.stranger_thread = helper.thread_ref(STRANGER)
+
+    def _direct(self):
+        c = sqlite3.connect(str(self.db))
+        c.text_factory = bytes
+        return c
+
+    def texts(self, result, key):
+        return [m["text"] for m in result[key]]
+
+    def test_off_means_invisible(self) -> None:
+        self.gate.unknown_senders = {"enabled": False, "lookback": "7d", "floor_at": None}
+        self.assertEqual(self.run_action("search", {"term": "stranger", "days": 90}, self.conn)["matches"], [])
+        self.assertEqual(self.run_action("review", {"days": 30}, self.conn)["counts"]["total_messages"], 0)
+        self.assertEqual(self.run_action("inbox", {"cursor": 0}, self.conn)["messages"], [])
+
+    def test_on_reads_recent_1to1_only_with_masked_label(self) -> None:
+        search = self.run_action("search", {"term": "stranger", "days": 90}, self.conn)
+        self.assertEqual(self.texts(search, "matches"), ["stranger #31"])  # 10-day-old and group excluded
+        [m] = search["matches"]
+        self.assertEqual(m["name"], "Unknown sender \u00b7\u00b7\u00b71234")
+        self.assertFalse(m["known"])
+        self.assertEqual(m["thread_ref"], self.stranger_thread)
+        history = self.run_action("chat_history", {"thread_ref": self.stranger_thread, "days": 90}, self.conn)
+        self.assertEqual(self.texts(history, "messages"), ["stranger #31"])
+        by_ref = self.run_action("chat_history", {"contact_ref": m["contact_ref"], "days": 90}, self.conn)
+        self.assertEqual(self.texts(by_ref, "messages"), ["stranger #31"])
+        blob = json.dumps([search, history, by_ref], ensure_ascii=False)
+        self.assertNotIn("5557771234", blob)
+        self.assertNotIn("555777", blob)
+
+    def test_known_contacts_still_need_grants(self) -> None:
+        # Carol is in Contacts with no read grant: the unknown setting doesn't cover her.
+        search = self.run_action("search", {"term": "SENTINEL", "days": 90}, self.conn)
+        self.assertEqual(search["matches"], [])
+
+    def test_watch_includes_unknowns_when_on(self) -> None:
+        inbox = self.run_action("inbox", {"cursor": 0}, self.conn)
+        self.assertEqual(self.texts(inbox, "messages"), ["stranger #31"])
+        self.run_action("watch_tick", {}, self.conn)
+        c = sqlite3.connect(str(self.db))
+        c.execute("INSERT INTO message VALUES (40, ?, 'new stranger', NULL, 0, 5)", (helper.to_apple_ns(time.time()),))
+        c.execute("INSERT INTO chat_message_join VALUES (6, 40)")
+        c.execute("INSERT INTO message VALUES (41, ?, 'stranger in group', NULL, 0, 5)", (helper.to_apple_ns(time.time()),))
+        c.execute("INSERT INTO chat_message_join VALUES (2, 41)")
+        c.commit()
+        c.close()
+        self.assertEqual(self.run_action("watch_tick", {}, self.conn)["new_count"], 1)
+        review = self.run_action("review", {"days": 30}, self.conn)
+        names = [e["name"] for b in ("needs_reply", "low_priority") for e in review[b]]
+        self.assertEqual(names, ["Unknown sender \u00b7\u00b7\u00b71234"])
+
+    def test_reply_by_thread_ref_needs_approval_then_grant(self) -> None:
+        result = self.run_action("send", {"thread_ref": self.stranger_thread, "text": "yes it's available"})
+        self.assertEqual(result["status"], "pending_approval")
+        payload = self.gate.approvals[result["approval_id"]]["payload"]
+        self.assertEqual(
+            payload,
+            {
+                "handle": STRANGER,
+                "display_name": "Unknown contact",
+                "service": "iMessage",
+                "text": "yes it's available",
+                "contact_origin": "unknown",
+            },
+        )
+        self.assertNotIn("5557771234", json.dumps(result))
+        self.gate.approve(result["approval_id"])
+        self.assertEqual(self.run_action("send_commit", {"approval_id": result["approval_id"]})["status"], "sent")
+        # After "Approve + text without asking 1 day" the gate holds a send grant for the handle.
+        self.gate.grants.append(grant(9, STRANGER, "send"))
+        again = self.run_action("send", {"thread_ref": self.stranger_thread, "text": "see you at 5"})
+        self.assertEqual(again["status"], "sent")
+        self.assertIn(f'buddy "{STRANGER}"', self.scripts[-1])
+
+    def test_group_thread_ref_cannot_be_a_send_target(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unknown thread_ref"):
+            self.run_action("send", {"thread_ref": helper.thread_ref("chat100200300"), "text": "hi"})
+
+    def test_save_contact(self) -> None:
+        result = self.run_action("save_contact", {"thread_ref": self.stranger_thread, "name": "Dave Plumber"})
+        self.assertEqual(result["saved"]["name"], "Dave Plumber")
+        self.assertNotIn("5557771234", json.dumps(result))
+        script = self.scripts[-1]
+        self.assertIn('first name:"Dave", last name:"Plumber"', script)
+        self.assertIn(helper.GROK_ADDED_MARKER, script)
+        self.assertIn(f'value:"{STRANGER}"', script)
+        self.assertIn(f'group "{helper.GROK_CONTACTS_GROUP}"', script)
+        self.assertIn(STRANGER, helper._load_state_file(helper.GROK_ADDED_PATH)["handles"])
+        self.assertEqual(self.gate.audits[-1][0], "contact_saved")
+        self.assertEqual(self.policy().send, (ALICE,))  # saving grants nothing
+
+    def test_save_contact_refuses_existing_and_bad_names(self) -> None:
+        with self.assertRaisesRegex(ValueError, "already in Contacts"):
+            self.run_action("save_contact", {"thread_ref": helper.thread_ref(ALICE), "name": "Not Alice"})
+        for name in ("", "x" * 101, "Call +1 555 777 1234", "a@b.com", "Mo\u202em", "line\nbreak"):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                self.run_action("save_contact", {"thread_ref": self.stranger_thread, "name": name})
+        with self.assertRaises(ValueError):
+            self.run_action("save_contact", {"to": STRANGER, "name": "Dave"})
+        self.assertEqual(self.scripts, [])
+
+    def test_added_by_grok_contacts_are_flagged_and_enforced(self) -> None:
+        self.run_action("save_contact", {"thread_ref": self.stranger_thread, "name": "Mom"})
+        contacts = {**CONTACTS, "5557771234": "Mom"}
+        helper._CONTACT_RAW_HANDLES["5557771234"] = STRANGER
+        self.assertEqual(helper.contact_origin(STRANGER, contacts), "added_by_grok")
+        result = helper.action_send({"thread_ref": self.stranger_thread, "text": "hi"}, None, contacts, self.policy())
+        payload = self.gate.approvals[result["approval_id"]]["payload"]
+        self.assertEqual((payload["display_name"], payload["contact_origin"]), ("Mom", "added_by_grok"))
+        # An approval created around the helper without the flag is refused at commit.
+        aid = str(uuid.uuid4())
+        self.gate.approvals[aid] = {
+            "kind": "send",
+            "status": "approved",
+            "payload": {"handle": STRANGER, "display_name": "Mom", "service": "iMessage", "text": "x"},
+        }
+        with self.assertRaisesRegex(ValueError, "does not match your contacts"):
+            helper.action_send_commit({"approval_id": aid}, None, contacts, self.policy())
+        # ...and a grant without the flag is dropped.
+        self.gate.grants = [grant(5, STRANGER, "send", display_name="Mom")]
+        self.assertEqual(helper.load_gate_policy(helper._GATE_CONTEXT, contacts).send, ())
+        self.gate.grants = [dict(grant(5, STRANGER, "send", display_name="Mom"), contact_origin="added_by_grok")]
+        self.assertEqual(helper.load_gate_policy(helper._GATE_CONTEXT, contacts).send, (STRANGER,))
+
+    def test_note_marker_alone_marks_origin(self) -> None:
+        contacts = {**CONTACTS, "5557771234": "Dave"}
+        helper._CONTACT_RAW_HANDLES["5557771234"] = STRANGER
+        self.assertEqual(helper.contact_origin(STRANGER, contacts), "contacts")
+        helper._CONTACT_GROK_ADDED.add("5557771234")
+        self.addCleanup(helper._CONTACT_GROK_ADDED.discard, "5557771234")
+        self.assertEqual(helper.contact_origin(STRANGER, contacts), "added_by_grok")
 
 
 class GateJsonFailClosedTests(unittest.TestCase):
