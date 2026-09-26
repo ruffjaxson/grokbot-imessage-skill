@@ -77,6 +77,14 @@ extern int _NSGetExecutablePath(char *buf, uint32_t *bufsize);
 #define READ_ALLOWLIST_PATH BRIDGE_ROOT "/contacts/allowed_chats.txt"
 #endif
 
+#ifndef IMESSAGE_GATE_PATH
+/* Optional: hardened installs bake the root-owned gate.json path. */
+#endif
+
+#ifndef CONTACT_REFS_SCRIPT
+/* Optional: contact-refs module path for validation and IMESSAGE_CONTACT_REFS_PATH. */
+#endif
+
 #ifndef REQUIRE_ROOT_POLICY
 #define REQUIRE_ROOT_POLICY 0
 #endif
@@ -850,6 +858,13 @@ int main(int argc, char **argv) {
     if (validation != 0) {
         return validation;
     }
+#ifdef CONTACT_REFS_SCRIPT
+    validation = validate_file(CONTACT_REFS_SCRIPT, "contact-refs module",
+                               expected_code_uid, false);
+    if (validation != 0) {
+        return validation;
+    }
+#endif
 
 #if REQUIRE_ROOT_POLICY
     validation = validate_file(READ_ALLOWLIST_PATH, "read allowlist", 0, false);
@@ -864,6 +879,20 @@ int main(int argc, char **argv) {
                 HELPER_DISPLAY_NAME);
         return 5;
     }
+#ifdef IMESSAGE_GATE_PATH
+    validation = validate_file(IMESSAGE_GATE_PATH, "gate config", 0, false);
+    if (validation != 0) {
+        return validation;
+    }
+    struct stat gate_st;
+    if (lstat(IMESSAGE_GATE_PATH, &gate_st) != 0 ||
+        (gate_st.st_mode & (S_IRWXG | S_IRWXO))) {
+        fprintf(stderr,
+                "%s: gate config has group/world permissions; refusing\n",
+                HELPER_DISPLAY_NAME);
+        return 5;
+    }
+#endif
 #endif
 
     struct passwd *pw = getpwuid(getuid());
@@ -875,6 +904,12 @@ int main(int argc, char **argv) {
     static char root_policy_buf[64];
     static char host_display_buf[128];
     static char snapshot_max_mb_buf[64];
+#ifdef CONTACT_REFS_SCRIPT
+    static char contact_refs_buf[PATH_MAX + 64];
+#endif
+#ifdef IMESSAGE_GATE_PATH
+    static char gate_path_buf[PATH_MAX + 64];
+#endif
 
     if (set_env_value(home_buf, sizeof(home_buf), "HOME",
                       pw && pw->pw_dir ? pw->pw_dir : "/") != 0 ||
@@ -893,6 +928,18 @@ int main(int argc, char **argv) {
                       "IMESSAGE_HOST_DISPLAY_NAME", HOST_DISPLAY_NAME) != 0) {
         return 7;
     }
+#ifdef CONTACT_REFS_SCRIPT
+    if (set_env_value(contact_refs_buf, sizeof(contact_refs_buf),
+                      "IMESSAGE_CONTACT_REFS_PATH", CONTACT_REFS_SCRIPT) != 0) {
+        return 7;
+    }
+#endif
+#ifdef IMESSAGE_GATE_PATH
+    if (set_env_value(gate_path_buf, sizeof(gate_path_buf),
+                      "IMESSAGE_GATE_PATH", IMESSAGE_GATE_PATH) != 0) {
+        return 7;
+    }
+#endif
 
     const char *snapshot_max_mb_env = getenv("IMESSAGE_SNAPSHOT_MAX_MB");
     bool snapshot_max_mb_set = false;
@@ -916,9 +963,18 @@ int main(int argc, char **argv) {
         host_display_buf,
         NULL,
         NULL,
+        NULL,
+        NULL,
     };
+    size_t env_next = (sizeof(new_env) / sizeof(new_env[0])) - 4;
+#ifdef CONTACT_REFS_SCRIPT
+    new_env[env_next++] = contact_refs_buf;
+#endif
+#ifdef IMESSAGE_GATE_PATH
+    new_env[env_next++] = gate_path_buf;
+#endif
     if (snapshot_max_mb_set) {
-        new_env[(sizeof(new_env) / sizeof(new_env[0])) - 2] = snapshot_max_mb_buf;
+        new_env[env_next++] = snapshot_max_mb_buf;
     }
     environ = new_env;
 

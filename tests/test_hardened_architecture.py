@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 from tests._helper_loader import REPO_ROOT, helper
+from tests.test_contact_refs import TEST_KEY, _match
 
 
 ALLOWLIST_TOOL_PATH = REPO_ROOT / "tools" / "configure_allowlist.py"
@@ -121,7 +122,7 @@ print(module.ALLOWLIST_PATH)
 
         self.assertEqual(filtered, messages[:1])
 
-    def test_allowlist_applies_to_contact_lookup(self) -> None:
+    def test_allowlist_does_not_apply_to_contact_lookup(self) -> None:
         policy = helper.PrivacyPolicy(
             mode="allowlist",
             allowlist=("alice@example.com",),
@@ -133,7 +134,39 @@ print(module.ALLOWLIST_PATH)
             {"alice@example.com": "Alice Example", "bob@example.com": "Bob Example"},
             policy,
         )
-        self.assertEqual(result["matches"], [{"name": "Alice Example", "email": "alice@example.com"}])
+        self.assertEqual(
+            result["matches"],
+            [
+                _match("Alice Example", "alice@example.com"),
+                _match("Bob Example", "bob@example.com"),
+            ],
+        )
+
+    def test_empty_allowlist_still_finds_contacts(self) -> None:
+        """Hardened installs default to allowlist mode with an empty root list."""
+        policy = helper.PrivacyPolicy(mode="allowlist", allowlist=(), blocklist=())
+        contacts = {"5551234567": "Emma Ruff", "5559876543": "Bob Example"}
+        result = helper.action_contacts_lookup(
+            {"name": "Emma Ruff"}, None, contacts, policy
+        )
+        self.assertEqual(result["match_count"], 1)
+        self.assertEqual(result["matches"][0]["name"], "Emma Ruff")
+
+    def test_blocklist_still_applies_to_contact_lookup(self) -> None:
+        policy = helper.PrivacyPolicy(
+            mode="blocklist",
+            allowlist=(),
+            blocklist=("bob@example.com",),
+        )
+        result = helper.action_contacts_lookup(
+            {"name": "Example"},
+            None,
+            {"alice@example.com": "Alice Example", "bob@example.com": "Bob Example"},
+            policy,
+        )
+        self.assertEqual(
+            result["matches"], [_match("Alice Example", "alice@example.com")]
+        )
 
     def test_email_entries_match_exactly(self) -> None:
         policy = helper.PrivacyPolicy(

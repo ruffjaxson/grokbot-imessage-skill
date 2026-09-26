@@ -33,6 +33,8 @@ CONTROL_DIR="$INSTALL_ROOT/control"
 CONTACTS_DIR="$INSTALL_ROOT/contacts"
 HELPER_PY="$BIN_DIR/helper.py"
 SEND_GATE_PY="$BIN_DIR/send_gate.py"
+CONTACT_REFS_PY="$BIN_DIR/contact_refs.py"
+GATE_JSON="$CONTACTS_DIR/gate.json"
 WRAPPER_SRC="$BIN_DIR/imessage_helper.c"
 WRAPPER_BIN="$BIN_DIR/grokbot-imessage-helper"
 CONFIRM_SRC="$BIN_DIR/confirm_imessage_send.m"
@@ -118,6 +120,10 @@ if [[ ! -f "$SEND_GATE_PY" ]]; then
     red "Missing $SEND_GATE_PY"
     exit 1
 fi
+if [[ ! -f "$CONTACT_REFS_PY" ]]; then
+    red "Missing $CONTACT_REFS_PY"
+    exit 1
+fi
 if [[ ! -f "$CONFIRM_SRC" ]]; then
     red "Missing $CONFIRM_SRC"
     exit 1
@@ -196,9 +202,16 @@ if [[ ! -f "$CONTACTS_DIR/read_policy.txt" ]]; then
     green "  created $CONTACTS_DIR/read_policy.txt (blocklist)"
 fi
 
+if [[ ! -f "$GATE_JSON" ]]; then
+    "$PYTHON3_PATH" -c 'import json, secrets; print(json.dumps({"schema_version": 1, "contact_ref_hmac_key": secrets.token_urlsafe(32)}))' \
+        > "$GATE_JSON"
+    chmod 600 "$GATE_JSON"
+    green "  created $GATE_JSON"
+fi
+
 # ---- 3. lock down Python code --------------------------------------------
-chmod 500 "$HELPER_PY" "$SEND_GATE_PY"
-green "  chmod 500 $HELPER_PY and $SEND_GATE_PY"
+chmod 500 "$HELPER_PY" "$SEND_GATE_PY" "$CONTACT_REFS_PY"
+green "  chmod 500 $HELPER_PY, $SEND_GATE_PY, and $CONTACT_REFS_PY"
 
 # ---- 4. build wrapper binary --------------------------------------------
 bold "Building wrapper binary..."
