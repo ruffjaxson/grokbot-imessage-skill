@@ -160,7 +160,9 @@ confirmation dialog:
     and closes it.
   - The wrapper is built and signed as root in a root-only directory. It runs only
     for the installing user's uid, sets `RLIMIT_CORE` to 0, and execs the real
-    interpreter rather than the `/usr/bin/python3` shim.
+    interpreter rather than the `/usr/bin/python3` shim. The installer resolves
+    that interpreter as root with an empty environment and accepts only one
+    inside the selected Apple developer tools.
   - **Residual risk:** after the drop, the worker is an ordinary process running
     as you and holds the secrets in memory. On this setup the interpreter is
     Apple-signed without `get-task-allow`, and with Developer Mode off both `lldb`

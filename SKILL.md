@@ -155,8 +155,8 @@ around it.
   - Saving grants nothing, and approvals for that contact are flagged "Added by Grok" on the
     phone.
   - Only save a name the user gave you. Never invent one or take it from the message text.
-  - It refuses numbers already in Contacts, and names that match an existing contact.
-    You can't edit existing contacts.
+  - It refuses numbers already in Contacts, and names that look like an existing contact's
+    name (including a shared first or last name). You can't edit existing contacts.
 
 ## When the watch routine runs
 
@@ -210,6 +210,8 @@ card numbers, and SSNs are redacted.
 | `… does not match your contacts …` | The approval's name or its "added by Grok" flag didn't match Contacts, so the helper refused. Tell the user. |
 | `unknown thread_ref` | Stale ref, or a group thread (you can't send to or save groups). |
 | `… already in Contacts …` | `save_contact` won't touch existing contacts. Use `contacts_lookup` instead. |
+| `… looks like …` | The name is too close to an existing contact. Ask the user for a more distinct name. |
+| `Contacts didn't load completely …` | `save_contact` can't check for duplicates right now. Tell the user. |
 | `Contacts could not save the entry …` | The user needs to allow the helper to control Contacts (first use only). |
 | No response file | Helper not running or missing Full Disk Access. Tell the user. |
 

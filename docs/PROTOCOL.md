@@ -602,9 +602,12 @@ allowlist:
   helper resolves both through chat.db.
 - **`save_contact {"thread_ref"|"contact_ref", "name"}`** creates a new Contacts entry through
   Contacts.app scripting. The entry goes in the group "Added by Grok" with a marker note. It
-  refuses handles already in Contacts and grants nothing. Approvals and grants for such
+  refuses handles already in Contacts, names that fold (Unicode, case, punctuation,
+  look-alike letters) to an existing name, nickname, first or last name, and any save while
+  Contacts didn't fully load. It grants nothing. Approvals and grants for such
   contacts carry `contact_origin: "added_by_grok"`, which the phone page flags. The helper
-  refuses commits, and drops grants, where the flag is missing.
+  refuses commits, and drops grants, where the flag is missing. If contact notes can't be
+  read, every contact is treated as added by Grok.
 - The local `blocked_chats.txt` still wins over every grant.
 - **Fail closed:** if the gate is unreachable, rejects the token, or `gate.json`
   names a gate incompletely, reads return nothing, sends and gate actions

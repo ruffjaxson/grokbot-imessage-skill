@@ -25,6 +25,13 @@ version reported by the `status` action.
 - Added the `com.jeffhuber.grokbot-imessage-watch` LaunchAgent (`tools/watch_tick.sh`)
   and `tools/configure_watch_webhook.sh`. When watched messages arrive, it sends a
   content-free trigger to a Grok Bot webhook routine.
+- `save_contact` refuses look-alike names and refuses to save when Contacts didn't
+  fully load. Unreadable contact notes mark every contact as added by Grok.
+- Secret rotation (`IMESSAGE_GATE_ROTATE=1` or an upgrade from the readable
+  `gate.json`) requires a new helper token. The wrapper's interpreter is resolved
+  as root and must come from the Apple developer tools. `doctor.py` checks the
+  baked interpreter, each worker image, and that the "Added by Grok" marker is
+  detectable.
 
 ## 1.4.8 - 2026-09-13
 
