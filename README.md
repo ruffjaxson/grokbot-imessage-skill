@@ -48,7 +48,7 @@ iMessage helpers.
 | macOS | 13+; CI on `macos-latest`; manual check on macOS 26.5, Apple silicon | Messages database and AppleScript are private/legacy integration surfaces and may change in future macOS releases. |
 | Python | 3.9, 3.11, and 3.13 in CI | The installer requires 3.9+. |
 | CPU | Apple silicon | The installer compiles from source locally; Intel is expected to build but is not currently exercised in CI. |
-| Grok | Grok Build user skills with `grok inspect` | The helper protocol is independently versioned and reports `1.1`; other hosts can use the bridge directly. |
+| Grok | Grok Build user skills with `grok inspect` | The helper protocol is independently versioned and reports `1.3` when gate mode is configured, `1.2` without (see `status.protocol_version`); other hosts can use the bridge directly. |
 
 ---
 
@@ -64,8 +64,22 @@ shasum -a 256 -c SHA256SUMS
 ```
 
 Unpack the verified archive and enter its directory. Release archives contain
-source only; the macOS binaries are compiled and signed locally. To contribute
-or follow `main` instead, clone the repository:
+source only; the macOS binaries are compiled and signed locally.
+
+**This fork (`ruffjaxson/grokbot-imessage-skill`):** approval-gate mode lives on
+the `jaxson` branch and the open PR branch `cursor/gate-backed-helper-9233`.
+There is **no signed release** with gate mode on this fork yet — do not expect
+Jeff's upstream release assets or tags to include `gate_client.py`, setuid
+secrets, or watch/power-nap wiring. Clone this fork and check out the branch you
+need:
+
+```bash
+git clone https://github.com/ruffjaxson/grokbot-imessage-skill.git
+cd grokbot-imessage-skill
+git checkout jaxson   # masking + contact_ref, or the gate PR branch when merged
+```
+
+To contribute to upstream or follow Jeff's signed releases instead:
 
 ```bash
 git clone https://github.com/jeffhuber/grokbot-imessage-skill.git
@@ -510,7 +524,7 @@ runtime identities.
 
 PRs welcome! If you find a bug or want to add a feature:
 
-1. Open an issue first to discuss the change.
+1. Open an issue first to discuss the change. For **this fork's gate-mode work**, use [ruffjaxson/grokbot-imessage-skill issues](https://github.com/ruffjaxson/grokbot-imessage-skill/issues); upstream Jeff Huber issues are for the base helper without gate mode.
 2. Submit a PR with tests under `tests/`.
 3. Follow the existing code style (Python 3.9+, type hints where helpful).
 4. Run `./tools/test.sh`, `bash -n` and `shellcheck` on the shell scripts,

@@ -24,4 +24,5 @@ load_privileged_tool_paths() {
     CODESIGN_BIN="$(_privileged_tool_path codesign)"
     ENV_BIN="$(_privileged_tool_path env)"
     MV_BIN="$(_privileged_tool_path mv)"
+    PMSET_BIN="$(_privileged_tool_path pmset)"
 }

@@ -191,6 +191,40 @@ tail -n 50 "$BRIDGE/control/log.txt"
 
 ---
 
+## Gate mode (hardened install only)
+
+Skip this section unless you installed with `./install-hardened.sh`, configured
+`gate.json` (gate URL + helper token), and run a separate approval-gate server.
+Standard installs and upstream release tags do not include gate mode.
+
+**Verify gate configuration:**
+
+```bash
+BRIDGE="<your-bridge-folder-path>"
+REQ_ID=$(date +%s)
+TMP="$BRIDGE/control/requests/.request-$REQ_ID.json.tmp"
+FINAL="$BRIDGE/control/requests/request-$REQ_ID.json"
+cat > "$TMP" <<EOF
+{"id": "$REQ_ID", "action": "status", "params": {}}
+EOF
+mv "$TMP" "$FINAL"
+# Poll response-$REQ_ID.json; expect status.gate.configured == true
+```
+
+**Send flow (no Mac dialog for gate sends):**
+
+1. `send_preview` or `send` with a granted contact → response includes
+   `pending_approval` and an approval URL (open on your phone).
+2. Approve on the phone, then poll `send_commit` with the returned
+   `approval_id` until `ok: true` or a terminal error.
+3. Gate sends do **not** show the native macOS confirmation dialog from
+   Test 6; phone approval replaces it for granted/auto-approved paths.
+
+**If this fails:** check `gate.json` permissions (root-only on hardened),
+gate server reachability, and `$BRIDGE/control/log.txt` for `gate` errors.
+
+---
+
 ## All Tests Pass?
 
 If you've reached this point and all tests passed:
@@ -234,7 +268,7 @@ If a test fails and the fix isn't obvious:
 
 1. Collect `$BRIDGE/control/log.txt`.
 2. Note which test failed and what the actual output was.
-3. Open an issue at [github.com/jeffhuber/grokbot-imessage-skill/issues](https://github.com/jeffhuber/grokbot-imessage-skill/issues) with:
+3. Open an issue at [github.com/ruffjaxson/grokbot-imessage-skill/issues](https://github.com/ruffjaxson/grokbot-imessage-skill/issues) for this fork's gate-mode work (upstream Jeff Huber issues for the base helper without gate mode) with:
    - macOS version
    - Grok Bot version (if applicable)
    - Test number that failed

@@ -9,6 +9,11 @@ description: >
 version: 1.4.8
 ---
 
+> **Gate mode is unreleased on this fork.** Do not pin jsDelivr `@v1.4.8` or
+> `@main` and expect approval-gate behavior — gate mode, setuid secrets, watch
+> webhook, and power nap exist only on the unreleased `jaxson`/PR branches
+> until this fork tags a release that includes them.
+
 # iMessage on macOS — Grok Bot
 
 You talk to a local helper through a **bridge folder**. The helper reads Messages and
@@ -88,7 +93,7 @@ tell the user: reads return nothing and sends fail until it's back. Don't work a
 
 1. `contacts_lookup {"name": "Emma"}` returns matches with `name`, `label`, `service`,
    `contact_ref`, and `scopes`. If several match, ask which one by name and label (e.g.
-   "Emma Ruff (mobile) or Emma Ruff (work)?").
+   "Emma Example (mobile) or Emma Example (work)?").
 2. Confirm the exact text with the user unless they already dictated it word for word.
 3. `send {"contact_ref": "…", "text": "…"}` (`service` optional: `iMessage` or `SMS`).
    - `"status": "sent"`: they had a `send` grant and it went out. Say so.

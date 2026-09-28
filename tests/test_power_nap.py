@@ -119,7 +119,7 @@ class PowerNapInstallTests(unittest.TestCase):
         self.assertIn("render_power_nap_plist", install)
         uninstall = (REPO_ROOT / "uninstall-hardened.sh").read_text()
         self.assertIn("POWER_NAP_LABEL", uninstall)
-        self.assertIn("pmset schedule cancel wake", uninstall)
+        self.assertIn('"$PMSET_BIN" schedule cancel wake', uninstall)
 
     def test_plist_template_has_interval_and_script(self) -> None:
         text = PLIST.read_text()

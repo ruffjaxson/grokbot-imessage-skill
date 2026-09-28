@@ -192,6 +192,11 @@ confirmation dialog:
 Standard (non-hardened) installs keep `gate.json` user-writable, so a gate
 there adds no protection against same-user processes.
 
+**Hardened gate installs supersede the section below for sends.** Gate mode
+routes outbound messages through phone approval (`send` → `pending_approval` →
+`send_commit`); the native Mac confirmation dialog in this section applies to
+standard and non-gate hardened paths only.
+
 ## Confirmation gate (sending)
 
 Sending is confirmation-gated via a two-layer preview/confirm protocol:

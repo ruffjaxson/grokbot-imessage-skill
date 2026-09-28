@@ -634,7 +634,7 @@ behaves as in protocol 1.2.
   "approval_id": "0b6c…",
   "approve_url": "https://imessage-gate.example.ts.net/a/0b6c…",
   "expires_at": "2026-09-26T05:10:00+00:00",
-  "recipient": {"name": "Emma Ruff", "service": "iMessage", "label": "mobile", "contact_ref": "…"}
+  "recipient": {"name": "Emma Example", "service": "iMessage", "label": "mobile", "contact_ref": "…"}
 }
 ```
 

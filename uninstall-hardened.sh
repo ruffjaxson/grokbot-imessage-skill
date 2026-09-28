@@ -49,7 +49,7 @@ if [[ -d "$POWER_NAP_STATE_DIR" ]]; then
         read -r epoch < "$state_file" || true
         if [[ "$epoch" =~ ^[0-9]+$ ]]; then
             fmt="$(date -r "$epoch" "+%m/%d/%y %H:%M:%S")"
-            sudo /usr/bin/pmset schedule cancel wake "$fmt" "$POWER_NAP_LABEL" 2>/dev/null || true
+            sudo "$PMSET_BIN" schedule cancel wake "$fmt" "$POWER_NAP_LABEL" 2>/dev/null || true
         fi
     fi
     sudo "$RM_BIN" -rf "$POWER_NAP_STATE_DIR"

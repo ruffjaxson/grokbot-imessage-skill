@@ -32,17 +32,17 @@ class ContactRefLookupTests(unittest.TestCase):
         self.assertEqual(helper._decode_addressbook_label(None), "")
 
     def test_lookup_match_fields(self) -> None:
-        match = _match("Emma Ruff", "4155551234", "mobile")
+        match = _match("Emma Example", "4155551234", "mobile")
         self.assertEqual(
             match,
             {
-                "name": "Emma Ruff",
+                "name": "Emma Example",
                 "service": "iMessage",
                 "label": "mobile",
                 "contact_ref": contact_refs.make_contact_ref("4155551234", TEST_KEY),
             },
         )
-        email_match = _match("Emma Ruff", "emma@example.com", "email 1")
+        email_match = _match("Emma Example", "emma@example.com", "email 1")
         self.assertEqual(email_match["service"], "email")
         self.assertEqual(email_match["label"], "email 1")
 
@@ -54,8 +54,8 @@ class ContactRefLookupTests(unittest.TestCase):
             }
         )
         contacts = {
-            "4155551234": "Emma Ruff",
-            "emma@example.com": "Emma Ruff",
+            "4155551234": "Emma Example",
+            "emma@example.com": "Emma Example",
         }
         helper._CONTACT_RAW_HANDLES.update(
             {
@@ -79,7 +79,7 @@ class ContactRefLookupTests(unittest.TestCase):
             self.assertRegex(match["contact_ref"], r"^[0-9a-f]{64}$")
 
     def test_unknown_contact_ref_rejected(self) -> None:
-        contacts = {"4155551234": "Emma Ruff"}
+        contacts = {"4155551234": "Emma Example"}
         with self.assertRaisesRegex(ValueError, "unknown contact_ref"):
             helper.resolve_send_recipient(
                 {"contact_ref": "0" * 64}, contacts
@@ -110,10 +110,10 @@ class ContactRefRoundTripTests(unittest.TestCase):
         self.addCleanup(self._env_patch.stop)
 
     def test_ref_round_trip_and_send_preview(self) -> None:
-        contacts = {"4155551234": "Emma Ruff"}
+        contacts = {"4155551234": "Emma Example"}
         helper._CONTACT_RAW_HANDLES["4155551234"] = "+14155551234"
         helper._CONTACT_HANDLE_LABELS["4155551234"] = "mobile"
-        match = _match("Emma Ruff", "4155551234", "mobile")
+        match = _match("Emma Example", "4155551234", "mobile")
         normalized = contact_refs.resolve_contact_ref(match["contact_ref"], contacts, key=TEST_KEY)
         self.assertEqual(normalized, "4155551234")
         self.assertEqual(helper.contact_raw_handle(normalized), "+14155551234")

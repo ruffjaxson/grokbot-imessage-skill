@@ -397,7 +397,7 @@ render_plist "$PLIST_DEST" "$PLIST_TEMPLATE"
 render_plist "$WATCH_PLIST_DEST" "$WATCH_PLIST_TEMPLATE"
 render_power_nap_plist() {
     local destination="$1"
-    "$PYTHON3_PATH" - "$destination" "$POWER_NAP_PLIST_TEMPLATE" "$CODE_ROOT" "$BRIDGE_ROOT" \
+    sudo "$PYTHON3_PATH" - "$destination" "$POWER_NAP_PLIST_TEMPLATE" "$CODE_ROOT" "$BRIDGE_ROOT" \
         "$POWER_NAP_LABEL" "$POWER_NAP_INTERVAL_S" "$CURRENT_USER" "$UID" "$HOME" \
         "$POWER_NAP_STATE_DIR" "$POWER_NAP_LOG" <<'PYGEN'
 import pathlib
@@ -423,12 +423,9 @@ for element in tree.getroot().iter():
             element.text = element.text.replace(key, value)
 tree.write(destination, encoding="UTF-8", xml_declaration=True)
 PYGEN
-    chmod 644 "$destination"
+    sudo "$CHMOD_BIN" 644 "$destination"
 }
-POWER_NAP_PLIST_RENDERED="$(mktemp "${TMPDIR:-/tmp}/grokbot-power-nap.XXXXXX")"
-render_power_nap_plist "$POWER_NAP_PLIST_RENDERED"
-sudo "$INSTALL_BIN" -o root -g wheel -m 644 "$POWER_NAP_PLIST_RENDERED" "$POWER_NAP_PLIST_DEST"
-rm -f "$POWER_NAP_PLIST_RENDERED"
+render_power_nap_plist "$POWER_NAP_PLIST_DEST"
 
 if [[ -e "$LEGACY_PLIST" || -L "$LEGACY_PLIST" ]]; then
     if "$PYTHON3_PATH" "$LEGACY_MIGRATOR" \
