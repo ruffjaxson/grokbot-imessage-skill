@@ -256,14 +256,14 @@ class PayloadHashTests(unittest.TestCase):
         (
             {
                 "handle": "+14155551234",
-                "display_name": "Emma Example",
+                "display_name": "Emma Ruff",
                 "service": "iMessage",
                 "text": 'Running late \u2014 10 min \U0001f64f\nsee you "soon"',
             },
             "d9e84882605061ed98199fcb7358d7f8dab87da85966345a4d8d5bcc84b9e4bf",
         ),
         (
-            {"handle": "emma@example.com", "display_name": "Emma Example", "scopes": ["read", "watch"], "duration_seconds": None},
+            {"handle": "emma@example.com", "display_name": "Emma Ruff", "scopes": ["read", "watch"], "duration_seconds": None},
             "c73d084c696f895bbee92863685bde0507d5188690961544e2961cde1b17e82d",
         ),
         (

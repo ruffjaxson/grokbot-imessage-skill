@@ -355,6 +355,7 @@ class DoctorAttachCheckTests(unittest.TestCase):
         self.assertEqual(self.doctor.worker_images(launcher), [launcher, app])
         self.assertEqual(self.doctor.worker_images(app), [app])
 
+    @unittest.skipUnless(sys.platform == "darwin", "macOS DevToolsSecurity attach checks")
     def test_baked_interpreter_must_be_in_the_wrapper(self) -> None:
         launcher, _ = self.framework_python()
         self.install(launcher)
@@ -364,6 +365,7 @@ class DoctorAttachCheckTests(unittest.TestCase):
         checks = self.doctor.python_attach_checks(self.code_root, skip_codesign=True)
         self.assertEqual(checks["python_interpreter_baked"]["status"], "fail")
 
+    @unittest.skipUnless(sys.platform == "darwin", "macOS DevToolsSecurity attach checks")
     def test_xcrun_shim_or_missing_record_fails(self) -> None:
         self.install(Path("/usr/bin/python3"))
         checks = self.doctor.python_attach_checks(self.code_root, skip_codesign=True)
