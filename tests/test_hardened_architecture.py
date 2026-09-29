@@ -151,12 +151,12 @@ print(module.ALLOWLIST_PATH)
     def test_empty_allowlist_still_finds_contacts(self) -> None:
         """Hardened installs default to allowlist mode with an empty root list."""
         policy = helper.PrivacyPolicy(mode="allowlist", allowlist=(), blocklist=())
-        contacts = {"5551234567": "Emma Ruff", "5559876543": "Bob Example"}
+        contacts = {"5551234567": "Emma Example", "5559876543": "Bob Example"}
         result = helper.action_contacts_lookup(
-            {"name": "Emma Ruff"}, None, contacts, policy
+            {"name": "Emma Example"}, None, contacts, policy
         )
         self.assertEqual(result["match_count"], 1)
-        self.assertEqual(result["matches"][0]["name"], "Emma Ruff")
+        self.assertEqual(result["matches"][0]["name"], "Emma Example")
 
     def test_blocklist_still_applies_to_contact_lookup(self) -> None:
         policy = helper.PrivacyPolicy(

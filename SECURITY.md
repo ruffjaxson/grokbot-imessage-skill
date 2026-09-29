@@ -139,6 +139,64 @@ the maximum disclosure to explicitly allowlisted chats, but any same-user proces
 can request and consume data from those chats. Do not allowlist conversations
 whose disclosure to another local process would be unacceptable.
 
+## Approval gate mode (hardened installs)
+
+When the root-owned `gate.json` names an approval gate (`gate_url`,
+`helper_token`), the gate replaces the local allowlist and the Mac
+confirmation dialog:
+
+- **Grants** (`send`, `read`, `watch`, each per contact, permanent or
+  expiring) come from the gate. Anything not granted becomes an approval that
+  only a passkey on the owner's phone can approve. The local blocklist still
+  wins.
+- **Secrets are root-only on disk.** `gate.json` (helper token and contact-ref HMAC
+  key) is root-owned, mode 600, single-link, with no user ACL, so no process running
+  as your user can read the file.
+  - The FDA wrapper is installed **setuid root**. It reads `gate.json` first,
+    before any other work, and copies it into a pipe.
+  - It then irrevocably drops to your uid/gid, confirming that `setuid(0)` now
+    fails, before it validates anything else or execs Python.
+  - The worker reads the secrets from the inherited pipe (`IMESSAGE_GATE_SECRETS_FD`)
+    and closes it.
+  - The wrapper is built and signed as root in a root-only directory. It runs only
+    for the installing user's uid, sets `RLIMIT_CORE` to 0, and execs the real
+    interpreter rather than the `/usr/bin/python3` shim. The installer resolves
+    that interpreter as root with an empty environment and accepts only one
+    inside the selected Apple developer tools.
+  - **Residual risk:** after the drop, the worker is an ordinary process running
+    as you and holds the secrets in memory. On this setup the interpreter is
+    Apple-signed without `get-task-allow`, and with Developer Mode off both `lldb`
+    and `task_for_pid` are refused for a normal user. Keep Developer Mode off;
+    `doctor.py` warns if it's on. A root broker would remove this residual risk
+    entirely.
+  - Without the token, a same-user process can't query the gate directly. Without
+    the key, it can't reverse `contact_ref`/`thread_ref` values into numbers.
+- **The helper token cannot approve or grant, even if leaked.** With it, a process
+  could read the grant list, create approval requests (which reach your phone and are
+  rate-limited), revoke grants, write audit entries, and consume an approval you
+  already granted.
+- **Other paths to raw numbers are out of this helper's control.** Keep Grok Bot's own
+  Messages automation off, and don't give Grok Bot Contacts or Full Disk Access.
+- **Commit sends the gate's copy.** `send_commit` sends the recipient, service,
+  and text stored by the gate at request time, after checking the payload hash.
+  The request cannot substitute its own text.
+- **Fail closed.** If the gate is unreachable, rejects the token, or `gate.json`
+  has an incomplete gate section, reads return nothing and sends error out.
+  The helper does not fall back to the local allowlist.
+- **Pre-granted contacts send without a prompt**, by design: a `send` grant is
+  standing permission, so any same-user process can text that contact until
+  the grant expires or is revoked. Keep `send` grants short and few.
+- The gate itself, and whoever controls its host and database, are now part of
+  the trusted computing base for sending and reading.
+
+Standard (non-hardened) installs keep `gate.json` user-writable, so a gate
+there adds no protection against same-user processes.
+
+**Hardened gate installs supersede the section below for sends.** Gate mode
+routes outbound messages through phone approval (`send` → `pending_approval` →
+`send_commit`); the native Mac confirmation dialog in this section applies to
+standard and non-gate hardened paths only.
+
 ## Confirmation gate (sending)
 
 Sending is confirmation-gated via a two-layer preview/confirm protocol:
@@ -220,9 +278,16 @@ precedence.
 
 ## What leaves the machine
 
-The helper itself does not make any outbound network connections. All
-message content read from `chat.db` or sent via AppleScript is
-processed on-device by the helper.
+Without an approval gate, the helper makes no outbound network connections.
+All message content read from `chat.db` or sent via AppleScript is processed
+on-device by the helper.
+
+With an approval gate configured (see below), the Full Disk Access process makes
+HTTPS requests to exactly one origin: the `gate_url` in the root-owned
+`gate.json`. Redirects and proxies are refused. Only the send payloads it asks
+you to approve (recipient handle, contact name, service, text) and grant
+requests leave the Mac, and only to that gate. Message history read from
+`chat.db` is never sent to the gate.
 
 When Grok Bot uses this skill, message content that Grok Bot reads
 passes through xAI's normal pipeline, which means it reaches

@@ -65,7 +65,58 @@ def _validate_gate_file(path: Path) -> None:
             )
 
 
+_SECRETS_FD_ENV = "IMESSAGE_GATE_SECRETS_FD"
+_SECRETS_MAX_BYTES = 16 * 1024
+_fd_config: dict[str, Any] | None = None
+
+
+def secrets_via_fd() -> bool:
+    """Hardened installs: the setuid wrapper read the root-only gate.json and
+    handed it over on an inherited pipe; the file itself is unreadable here."""
+    return bool(os.environ.get(_SECRETS_FD_ENV, "").strip())
+
+
+def _read_secrets_fd() -> dict[str, Any]:
+    global _fd_config
+    if _fd_config is not None:
+        return dict(_fd_config)
+    raw_fd = os.environ.get(_SECRETS_FD_ENV, "").strip()
+    if not raw_fd.isdigit():
+        raise ContactRefError(f"{_SECRETS_FD_ENV} must be a file descriptor number")
+    fd = int(raw_fd)
+    try:
+        if not stat.S_ISFIFO(os.fstat(fd).st_mode):
+            raise ContactRefError("gate secrets descriptor is not a pipe")
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > _SECRETS_MAX_BYTES:
+                raise ContactRefError("gate secrets are too large")
+            chunks.append(chunk)
+    except OSError as exc:
+        raise ContactRefError(f"gate secrets descriptor unreadable: {exc}") from exc
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    try:
+        data = json.loads(b"".join(chunks).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ContactRefError(f"gate secrets are not valid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ContactRefError("gate config root must be an object")
+    _fd_config = data
+    return dict(data)
+
+
 def load_gate_config() -> dict[str, Any]:
+    if secrets_via_fd():
+        return _read_secrets_fd()
     path = _gate_path()
     _validate_gate_file(path)
     try:

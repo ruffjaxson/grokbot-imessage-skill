@@ -489,7 +489,7 @@ result = helper.action_status({}, None, {}, [])
 assert result["bridge_role"] == "host", f"Expected host, got {result['bridge_role']}"
 assert "review" in result["allowed_actions"], "review should be in allowed_actions"
 assert "send" in result["allowed_actions"], "send should be in allowed_actions"
-assert len(result["allowed_actions"]) == 8, f"Expected 8 actions, got {len(result['allowed_actions'])}"
+assert len(result["allowed_actions"]) == len(helper._HOST_ACTIONS) == 16, f"Expected 16 actions, got {len(result['allowed_actions'])}"
 print("OK")
 """
         completed = subprocess.run(

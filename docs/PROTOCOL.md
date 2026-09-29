@@ -2,7 +2,7 @@
 
 This document describes the JSON-based request/response protocol that both Claude Cowork and Grok Bot use to communicate with the macOS helper.
 
-Protocol version: `1.2`
+Protocol version: `1.3`
 
 Clients should call `status` before their first message operation and require a
 compatible `protocol_version`. Minor versions add backward-compatible actions or
@@ -10,6 +10,10 @@ fields; a future major-version mismatch must fail closed with upgrade guidance.
 
 Protocol history:
 
+- `1.3` — adds approval-gate mode: `send_commit`, `request_grant`,
+  `approval_status`, `list_grants`, `revoke_grant`, `inbox`, and `watch_tick`;
+  `scopes` in `contacts_lookup`; `authorization` in `send_preview`; and the
+  `gate` block in `status`. See [Approval Gate Mode](#approval-gate-mode-13).
 - `1.2` — adds the manager-only `list_chats` action, the bridge role table
   below, and the `bridge_role` / `allowed_actions` fields in `status`.
 - `1.1` — `status` action and protocol compatibility reporting.
@@ -29,6 +33,9 @@ relied on. Unknown role values fail closed: no action is served.
 | `response_stats` | yes | no | no |
 | `contacts_lookup` | yes (policy-filtered) | yes | no |
 | `send_preview`, `send` | yes | no | draft only |
+| `send_commit`, `request_grant`, `approval_status` | yes (gate mode) | no | no |
+| `list_grants`, `revoke_grant`, `watch_tick`, `save_contact` | yes (gate mode) | no | no |
+| `inbox` | yes (gate mode) | no | yes (watch-scoped) |
 | `list_chats` | **no** | yes | no |
 
 A `host` bridge is what an AI host talks to. A `manager` bridge is operated by
@@ -80,7 +87,8 @@ remaining directories under the user-owned bridge root:
     ├── grokbot-imessage-helper       # Compiled C wrapper (FDA target)
     ├── grokbot-imessage-confirm        # Native, fail-safe send confirmation
     ├── helper.py                     # Python worker
-    └── send_gate.py                  # Send nonce validation
+    ├── send_gate.py                  # Send nonce validation
+    └── gate_client.py                # Approval-gate HTTPS client (gate mode)
 
 <bridge-folder>/
 ├── control/
@@ -91,7 +99,8 @@ remaining directories under the user-owned bridge root:
 │   ├── blocked_chats.txt             # User-maintained blocklist
 │   ├── allowed_chats.txt             # Standard-mode optional allowlist
 │   └── read_policy.txt                # blocklist or allowlist
-└── nonces/                            # Short-lived send-preview nonces
+├── nonces/                            # Short-lived send-preview nonces
+└── state/watch.json                   # inbox / watch_tick cursors (gate mode)
 ```
 
 For a standard install, `<code-root>` and `<bridge-folder>` are the same path.
@@ -564,6 +573,134 @@ The helper writes `text` to a temporary UTF-8 file, shells out to `/usr/bin/osas
 - **Group chat IDs are NOT supported as send targets.** Attempting to send to a `chatNNNNN` identifier will fail. Use individual phone numbers or email addresses only.
 
 ---
+
+## Approval Gate Mode (1.3)
+
+A hardened install can point the helper at an `imessage-gate` approval service by
+adding `gate_url` and `helper_token` to the root-owned `gate.json` (see the
+README). The helper then takes its policy from the gate instead of the local
+allowlist:
+
+- Per-contact **grants**, each permanent or expiring:
+  - `send`: text the contact without asking;
+  - `read`: `search`, `chat_history`, and `response_stats` may return that thread;
+  - `watch`: `review`, `inbox`, and `watch_tick` include that contact.
+- Anything not granted becomes an **approval** that the owner approves or
+  denies on their phone with a passkey. The helper can request approvals,
+  consume approved sends, list and revoke grants, and write audit entries. It
+  cannot approve anything or create a grant.
+- A grant covers only the **1:1 thread** with that exact handle (E.164 or lowercased email).
+  Group threads are never covered, even for messages the contact sent there.
+- `read` and `watch` grants carry a **history floor** (`lookback`): `grant_time` (the
+  default, only messages from the grant on), `7d`, `30d`, or `all`. The approver sets it on
+  the phone. Every read and watch action drops messages older than the floor.
+- **Unknown senders:** a standing gate setting (turned on with a passkey on `/grants`,
+  with a rolling window of 24h, 7d, or 30d) lets read and watch actions include 1:1 threads
+  whose handle isn't in Contacts. They're labelled `"Unknown sender ···1234"` with
+  `"known": false`, plus `thread_ref` and `contact_ref`. `send`, `chat_history`, and
+  `request_grant` accept `thread_ref` (1:1 only) or an unsaved number's `contact_ref`; the
+  helper resolves both through chat.db.
+- **`save_contact {"thread_ref"|"contact_ref", "name"}`** creates a new Contacts entry through
+  Contacts.app scripting. The entry goes in the group "Added by Grok" with a marker note. It
+  refuses handles already in Contacts, names that fold (Unicode, case, punctuation,
+  look-alike letters) to an existing name, nickname, first or last name, and any save while
+  Contacts didn't fully load. It grants nothing. Approvals and grants for such
+  contacts carry `contact_origin: "added_by_grok"`, which the phone page flags. The helper
+  refuses commits, and drops grants, where the flag is missing. If contact notes can't be
+  read, every contact is treated as added by Grok.
+- The local `blocked_chats.txt` still wins over every grant.
+- **Fail closed:** if the gate is unreachable, rejects the token, or `gate.json`
+  names a gate incompletely, reads return nothing, sends and gate actions
+  error, and `status.gate.reachable` is `false`.
+- Agents never see raw phone numbers or emails; contacts appear as `name`,
+  `label`, and the opaque `contact_ref`.
+
+Without a gate section, gate-only actions return
+`"the approval gate is not configured on this install"` and everything else
+behaves as in protocol 1.2.
+
+### Sending in gate mode
+
+`send` (with `contact_ref` or `to`, `text`, optional `service`) no longer needs
+`send_preview` or a nonce, and does not show the Mac confirmation dialog:
+
+- With an active `send` grant it sends immediately:
+  `{"status": "sent", "sent": {"name", "label", "contact_ref", "via": "send_grant", ...}}`.
+- Otherwise it creates an approval and sends nothing:
+
+```json
+{
+  "status": "pending_approval",
+  "approval_id": "0b6c…",
+  "approve_url": "https://imessage-gate.example.ts.net/a/0b6c…",
+  "expires_at": "2026-09-26T05:10:00+00:00",
+  "recipient": {"name": "Emma Example", "service": "iMessage", "label": "mobile", "contact_ref": "…"}
+}
+```
+
+Share `approve_url` with the user, then poll `send_commit {"approval_id"}`:
+
+- still pending: `{"status": "pending_approval", "approval_id"}`;
+- approved: the helper atomically consumes the approval, verifies the gate's
+  payload hash, and sends the **gate-stored** recipient, service, and text.
+  Anything else in the request is ignored. Returns `{"status": "sent", ...}`;
+- denied, expired, or already consumed: an error naming the status. Nothing is sent.
+
+Never report a message as sent until `status` is `"sent"`. Approvals expire
+after 10 minutes, and the gate rate-limits approval requests (about 10 per
+hour). A rate-limit error includes the retry delay.
+
+`send_preview` in gate mode validates and returns the preview plus
+`"authorization": "send_grant"` or `"approval_required"`. It sends nothing and
+creates no approval.
+
+### `request_grant`
+
+```json
+{"action": "request_grant", "params": {"contact_ref": "…", "scopes": ["watch", "read"], "duration": "1w"}}
+```
+
+`scopes` is any non-empty subset of `send`, `read`, `watch`. `duration` is
+required: `"30m"`, `"12h"`, `"1d"`, `"1w"`, a number of seconds (minimum 60,
+maximum a year), or `"always"`. For `read`/`watch`, `lookback` is one of
+`grant_time` (default), `7d`, `30d`, or `all`. Presets replace `scopes`/`duration`:
+`{"preset": "trusted"}` (permanent send + read, lookback default `grant_time`; add
+`"scopes": ["watch"]` to include watch) and `{"preset": "standard", "duration": "1d"|"1w"}`
+(send only). The approver can choose a different preset or lookback. Returns
+`pending_approval` with `approve_url`, like `send`.
+
+### `approval_status`
+
+`{"approval_id"}` → `{"approval_id", "kind", "status", "expires_at", "decided_at"}`,
+plus `grants` (`grant_id`, `scope`, `expires_at`) once a grant request is approved.
+
+### `list_grants` / `revoke_grant`
+
+`list_grants` returns the active grants as
+`{"grant_id", "scope", "expires_at", "lookback", "history_from", "name", "label", "service", "contact_ref"}`.
+`revoke_grant` takes `{"grant_id"}` or `{"contact_ref", "scope"?}` (every
+active grant for that contact, optionally one scope). It needs no approval.
+
+### `inbox`
+
+New inbound messages from `watch`-scoped contacts:
+
+```json
+{"action": "inbox", "params": {"cursor": 1234, "limit": 50}}
+```
+
+Each message is `{"message_id", "ts", "name", "label", "contact_ref",
+"is_group", "text"}` (redacted like other reads). The response also has
+`cursor`, `next_cursor`, `has_more`, and `count`. Without `cursor`, the helper
+resumes from its own saved inbox cursor (on the first run, the last 24 hours)
+and advances it. With an explicit `cursor`, the saved one is left alone.
+
+### `watch_tick`
+
+Content-free, for a background trigger:
+`{"new_count", "initialized", "capped"}` is the number of new inbound messages
+from watched contacts since the previous tick. The first tick only records the
+current position. The cursor is kept in `<bridge>/state/watch.json`.
 
 ## Redaction
 

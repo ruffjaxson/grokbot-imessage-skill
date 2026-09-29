@@ -6,6 +6,38 @@ version reported by the `status` action.
 
 ## Unreleased
 
+- Added approval-gate mode (protocol 1.3) for hardened installs. When the
+  root-owned `gate.json` names an `imessage-gate` service, per-contact
+  `send` / `read` / `watch` grants come from the gate, and ungranted sends or
+  grant requests go to the owner's phone for passkey approval. New actions:
+  `send_commit` (sends the gate-stored payload of an approved send, once),
+  `request_grant`, `approval_status`, `list_grants`, `revoke_grant`, `inbox`,
+  and `watch_tick`. `contacts_lookup` reports scopes. Gate failures fail closed.
+- Added `bin/gate_client.py` (stdlib HTTPS client pinned to one origin). The
+  C wrapper validates it like the other trusted modules.
+- The hardened installer accepts `IMESSAGE_GATE_URL` and prompts for the helper
+  token without echoing it (or reads `IMESSAGE_GATE_TOKEN_FILE`). The new
+  `tools/configure_gate.py` writes `gate.json` atomically at mode 600.
+- Installs without a gate section behave exactly as before.
+- Hardened installs keep `gate.json` root-only. The FDA wrapper is installed
+  setuid root, reads it, passes it to the helper on a pipe, and irrevocably drops
+  privileges before any other work.
+- Added the `com.jeffhuber.grokbot-imessage-watch` LaunchAgent (`tools/watch_tick.sh`)
+  and `tools/configure_watch_webhook.sh`. When watched messages arrive, it sends a
+  content-free trigger to a Grok Bot webhook routine.
+- Added the root `com.jeffhuber.grokbot-imessage-power-nap.<uid>` LaunchDaemon
+  (`tools/power_nap_tick.sh`) for hardened installs. On AC power it chains
+  `pmset schedule wake` events about every seven minutes, runs one `watch_tick`
+  after a recent wake from sleep, and never holds sleep assertions. On battery it
+  cancels owned wake events. `doctor.py` reports daemon and schedule health.
+- `save_contact` refuses look-alike names and refuses to save when Contacts didn't
+  fully load. Unreadable contact notes mark every contact as added by Grok.
+- Secret rotation (`IMESSAGE_GATE_ROTATE=1` or an upgrade from the readable
+  `gate.json`) requires a new helper token. The wrapper's interpreter is resolved
+  as root and must come from the Apple developer tools. `doctor.py` checks the
+  baked interpreter, each worker image, and that the "Added by Grok" marker is
+  detectable.
+
 ## 1.4.8 - 2026-09-13
 
 - Fixed `configure_allowlist.py` to work with hardened install layout where the
